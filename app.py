@@ -140,7 +140,7 @@ if not st.session_state.logged_in:
     st.stop()
 
 # ========================== الواجهة بعد تسجيل الدخول ==========================
-st.title("📊 ديالى - البحث في سجلات الناخبين")
+st.title("📊 بغداد - البحث في سجلات الناخبين")
 st.markdown("سيتم البحث في قواعد البيانات باستخدام الذكاء الاصطناعي 🤖")
 
 # ====== تبويبات ======
@@ -231,14 +231,14 @@ with tab_browse:
 
     where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
-    count_sql = f'SELECT COUNT(*) FROM "dyala" {where_sql};'
+    count_sql = f'SELECT COUNT(*) FROM "Bagdad" {where_sql};'
     offset = (st.session_state.page - 1) * page_size
     data_sql = f'''
         SELECT
             "رقم الناخب","الاسم الثلاثي","الجنس","هاتف","رقم العائلة",
             "اسم مركز الاقتراع","رقم مركز الاقتراع",
             "المدينة","رقم مركز التسجيل","اسم مركز التسجيل","تاريخ الميلاد"
-        FROM "dyala"
+        FROM "Bagdad"
         {where_sql}
         ORDER BY "رقم الناخب" ASC
         LIMIT %s OFFSET %s;
@@ -302,7 +302,7 @@ with tab_single:
                 SELECT "رقم الناخب","الاسم الثلاثي","الجنس","هاتف","رقم العائلة",
                        "اسم مركز الاقتراع","رقم مركز الاقتراع",
                        "المدينة","رقم مركز التسجيل","اسم مركز التسجيل","تاريخ الميلاد"
-                FROM "dyala" WHERE "رقم الناخب" LIKE %s
+                FROM "Bagdad" WHERE "رقم الناخب" LIKE %s
             """
             df = pd.read_sql_query(query, conn, params=(voter_input.strip(),))
             conn.close()
@@ -347,7 +347,7 @@ with tab_file:
                 SELECT "رقم الناخب","الاسم الثلاثي","الجنس","هاتف","رقم العائلة",
                        "اسم مركز الاقتراع","رقم مركز الاقتراع",
                        "المدينة","رقم مركز التسجيل","اسم مركز التسجيل","تاريخ الميلاد"
-                FROM "dyala" WHERE "رقم الناخب" IN ({placeholders})
+                FROM "Bagdad" WHERE "رقم الناخب" IN ({placeholders})
             """
             df = pd.read_sql_query(query, conn, params=voters_list)
             conn.close()
@@ -413,7 +413,7 @@ with tab_file:
         except Exception as e:
             st.error(f"❌ خطأ: {e}")
 # ----------------------------------------------------------------------------- #
-# 4️⃣ التبويب الرابع: البحث الذكي بالاسم + مركز الاقتراع (dyala)
+# 4️⃣ التبويب الرابع: البحث الذكي بالاسم + مركز الاقتراع (Bagdad)
 # ----------------------------------------------------------------------------- #
 with tab_file_name_center:
     st.subheader("🔎 البحث الذكي (اسم + مركز اقتراع) ⚡")
@@ -441,14 +441,14 @@ with tab_file_name_center:
         return s.fillna("").astype(str).map(mapping)
 
     @st.cache_data(show_spinner=False)
-    def load_all_dyala():
-        # تحميل كل البيانات التي نحتاجها من جدول dyala
+    def load_all_Bagdad():
+        # تحميل كل البيانات التي نحتاجها من جدول Bagdad
         conn = get_conn()
         try:
             df = pd.read_sql_query(
                 '''
                 SELECT "رقم الناخب","الاسم الثلاثي","اسم مركز الاقتراع"
-                FROM "dyala"
+                FROM "Bagdad"
                 ''',
                 conn
             )
@@ -474,8 +474,8 @@ with tab_file_name_center:
         df["__norm_name"] = normalize_fast(df["الاسم"])
         df["__norm_center"] = normalize_fast(df["اسم مركز الاقتراع"])
 
-        # جميع بيانات ديالى
-        db_all = load_all_dyala()
+        # جميع بيانات بغداد
+        db_all = load_all_Bagdad()
         db_all["__norm_name"] = normalize_fast(db_all["الاسم الثلاثي"])
         db_all["__norm_center"] = normalize_fast(db_all["اسم مركز الاقتراع"])
 
@@ -611,7 +611,7 @@ with tab_count:
                         SELECT "رقم الناخب","الاسم الثلاثي","الجنس","هاتف","رقم العائلة",
                                "اسم مركز الاقتراع","رقم مركز الاقتراع",
                                "المدينة","رقم مركز التسجيل","اسم مركز التسجيل","تاريخ الميلاد"
-                        FROM "dyala" WHERE "رقم الناخب" IN ({placeholders})
+                        FROM "Bagdad" WHERE "رقم الناخب" IN ({placeholders})
                     """
                     found_df = pd.read_sql_query(query, conn, params=unique_numbers)
                     conn.close()
@@ -732,7 +732,7 @@ with tab_check:
                 placeholders = ",".join(["%s"] * len(voter_list))
                 query = f"""
                     SELECT "رقم الناخب","الاسم الثلاثي","رقم العائلة","رقم مركز الاقتراع"
-                    FROM "dyala"
+                    FROM "Bagdad"
                     WHERE "رقم الناخب" IN ({placeholders})
                 """
                 df_db = pd.read_sql_query(query, conn, params=voter_list)

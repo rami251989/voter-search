@@ -144,7 +144,7 @@ st.title("📊 بغداد - البحث في سجلات الناخبين")
 st.markdown("سيتم البحث في قواعد البيانات باستخدام الذكاء الاصطناعي 🤖")
 
 # ====== تبويبات ======
-tab_browse, tab_single, tab_file, tab_file_name_center, tab_count, tab_check, tab_count_custom, tab_qr = st.tabs(
+tab_browse, tab_single, tab_file, tab_file_name_center, tab_count, tab_check, tab_count_custom, tab_qr, tab_cards_pdf = st.tabs(
     [
         "📄 تصفّح السجلات",
         "🔍 بحث برقم",
@@ -153,8 +153,8 @@ tab_browse, tab_single, tab_file, tab_file_name_center, tab_count, tab_check, ta
         "📦 عدّ البطاقات",
         "🧾 التحقق من المعلومات",
         "🧮 تحليل البيانات (COUNT)",
-        "🧾 توليد QR PDF"  # ← التاب الجديد هنا ✅
-        "🖼️ مطابقة البطاقات → PDF"   # ✅ التاب الجديدة
+        "🧾 توليد QR PDF",
+        "🖼️ مطابقة البطاقات → PDF"
     ]
 )
 

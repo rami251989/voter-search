@@ -154,6 +154,7 @@ tab_browse, tab_single, tab_file, tab_file_name_center, tab_count, tab_check, ta
         "🧾 التحقق من المعلومات",
         "🧮 تحليل البيانات (COUNT)",
         "🧾 توليد QR PDF"  # ← التاب الجديد هنا ✅
+        "🪪 مطابقة البطاقات ➜ PDF"  # ✅ التاب الجديدة
     ]
 )
 
@@ -928,3 +929,333 @@ with tab_qr:
             except Exception as e:
                 st.error(f"❌ حدث خطأ أثناء إنشاء PDF: {e}")
 
+# ----------------------------------------------------------------------------- #
+# 🪪 التاب الجديدة: مطابقة البطاقات وإنتاج PDF عمودين (هوية موحدة | بطاقة ناخب)
+# ----------------------------------------------------------------------------- #
+with tab_pairpdf:
+    st.subheader("🪪 مطابقة البطاقات بالاسم وإنتاج PDF (عمودان)")
+
+    st.markdown("""
+    **الآلية:**
+    1) ارفع صورًا متعددة؛ قد تحتوي الصورة الواحدة على أكثر من بطاقة.  
+    2) سيقوم النظام بقصّ البطاقات تلقائيًا، ثم استخدام OCR لاستخراج الاسم.  
+    3) يحدّد النظام نوع البطاقة (البطاقة الوطنية الموحدة/بطاقة الناخب) عبر كلمات مفتاحية.  
+    4) يطابق البطاقات حسب الاسم ويُنتج PDF نهائي فيه عمودان: **هوية موحدة | بطاقة ناخب**.  
+    """)
+
+    imgs_cards = st.file_uploader(
+        "📤 ارفع صور البطاقات (JPG/PNG) – يمكن رفع عدة صور، والصورة قد تحتوي أكثر من بطاقة",
+        type=["jpg","jpeg","png"],
+        accept_multiple_files=True,
+        key="pair_cards_uploader"
+    )
+
+    # ---------- أدوات مساعدة محلية (لا تغيّر شيئًا خارج هذا التاب) ----------
+    def _normalize_ar(text: str) -> str:
+        if not text:
+            return ""
+        s = str(text)
+        # إزالة التشكيل
+        s = s.translate(str.maketrans('', '', ''.join([
+            '\u0610','\u0611','\u0612','\u0613','\u0614','\u0615','\u0616','\u0617','\u0618','\u0619','\u061A',
+            '\u064B','\u064C','\u064D','\u064E','\u064F','\u0650','\u0651','\u0652','\u0653','\u0654','\u0655',
+            '\u0656','\u0657','\u0658','\u0659','\u065A','\u065B','\u065C','\u065D','\u065E','\u065F','\u0670'
+        ])))
+        s = s.replace("ـ", "").strip()
+        s = (s.replace("أ","ا").replace("إ","ا").replace("آ","ا")
+               .replace("ؤ","و").replace("ئ","ي").replace("ى","ي").replace("ة","ه"))
+        # إزالة المسافات الزائدة
+        s = " ".join(s.split())
+        return s
+
+    def _guess_card_type(text: str) -> str:
+        """يعيد 'unified' للبطاقة الوطنية الموحدة، 'voter' لبطاقة الناخب، أو '' عند عدم التحديد."""
+        t = text or ""
+        t_norm = _normalize_ar(t)
+        # كلمات مفتاحية
+        kw_unified = ["البطاقه الوطنيه الموحده", "الهويه الوطنيه", "البطاقه الموحده", "وزارة الداخليه", "الاحوال المدنيه"]
+        kw_voter   = ["بطاقه الناخب", "المفوضيه", "الانتخابات", "المفوضيه العليا المستقله للانتخابات"]
+        if any(k in t_norm for k in kw_unified):
+            return "unified"
+        if any(k in t_norm for k in kw_voter):
+            return "voter"
+        # تخمين إضافي: وجود كلمة "الناخب" vs "الوطنيه"
+        if "الناخب" in t_norm:
+            return "voter"
+        if "الوطنيه" in t_norm or "الموحده" in t_norm:
+            return "unified"
+        return ""
+
+    def _extract_name_from_text(text: str) -> str:
+        """يحاول استخراج الاسم من نص عربي عبر اختيار أطول سطر عربي مناسب."""
+        if not text:
+            return ""
+        # نقسّم لأسطر ونختار الأسطر العربية فقط
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        ar_lines = []
+        for ln in lines:
+            # سطر عربي (يحتوي على حروف المدى العربي)
+            if re.search(r"[\u0600-\u06FF]{2,}", ln):
+                # استبعاد الأسطر الصريحة التي تحوي كلمات نوع البطاقة
+                ln_norm = _normalize_ar(ln)
+                if "بطاقه" in ln_norm or "الناخب" in ln_norm or "الوطنيه" in ln_norm or "الموحده" in ln_norm:
+                    continue
+                # استبعاد الأسطر القصيرة جداً
+                if len(ln_norm) < 6:
+                    continue
+                ar_lines.append(ln)
+        if not ar_lines:
+            return ""
+        # اختر السطر الذي يحوي أكثر من كلمتين وعادةً يكون أطول/أغنى
+        ar_lines.sort(key=lambda s: (len(s), s.count(" ")), reverse=True)
+        return ar_lines[0]
+
+    def _read_bytes(file) -> bytes:
+        pos = file.tell()
+        content = file.read()
+        file.seek(pos)
+        return content
+
+    def _detect_and_crop_cards(img_bgr: np.ndarray) -> list:
+        """
+        يكشف مستطيلات تشبه البطاقات ويعيد قائمة صور مقصوصة (BGR).
+        نهج بسيط: تحويل رمادي -> بلور -> Canny -> كونتورز -> ترشيح نسبة الطول/العرض والمساحة -> warp.
+        """
+        out = []
+        h, w = img_bgr.shape[:2]
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5,5), 0)
+        edges = cv2.Canny(gray, 60, 180)
+        edges = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
+        cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        def four_point_transform(image, pts):
+            rect = np.array(pts, dtype="float32")
+            # ترتيب النقاط تقريبيًا (left-top, right-top, right-bottom, left-bottom)
+            s = rect.sum(axis=1)
+            diff = np.diff(rect, axis=1)
+            tl = rect[np.argmin(s)]
+            br = rect[np.argmax(s)]
+            tr = rect[np.argmin(diff)]
+            bl = rect[np.argmax(diff)]
+            rect = np.array([tl, tr, br, bl], dtype="float32")
+            (tl, tr, br, bl) = rect
+            widthA = np.linalg.norm(br - bl)
+            widthB = np.linalg.norm(tr - tl)
+            maxWidth = int(max(widthA, widthB))
+            heightA = np.linalg.norm(tr - br)
+            heightB = np.linalg.norm(tl - bl)
+            maxHeight = int(max(heightA, heightB))
+            if maxWidth < 100 or maxHeight < 60:
+                return None
+            dst = np.array([
+                [0, 0],
+                [maxWidth - 1, 0],
+                [maxWidth - 1, maxHeight - 1],
+                [0, maxHeight - 1]], dtype="float32")
+            M = cv2.getPerspectiveTransform(rect, dst)
+            warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
+            return warped
+
+        for c in cnts:
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+            if len(approx) == 4:
+                area = cv2.contourArea(approx)
+                if area < (w*h) * 0.01:  # استبعاد القطع الصغيرة جدًا
+                    continue
+                # نسبة العرض إلى الارتفاع تقارب بطاقة (1.4 إلى 1.9 غالباً أفقية)
+                x, y, cw, ch = cv2.boundingRect(approx)
+                ar = cw / float(ch)
+                if 1.2 <= ar <= 2.2 or 0.5 <= ar <= 0.9:  # أفقية أو عمودية
+                    warped = four_point_transform(img_bgr, approx.reshape(4,2))
+                    if warped is not None:
+                        out.append(warped)
+        # في حال لم يتم التقاط أي شيء، اعتبر الصورة كلها بطاقة واحدة
+        if not out:
+            out = [img_bgr]
+        return out
+
+    def _cv2_to_png_bytes(img_bgr: np.ndarray) -> bytes:
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(img_rgb)
+        buf = io.BytesIO()
+        pil.save(buf, format="PNG")
+        return buf.getvalue()
+
+    if imgs_cards and st.button("🚀 تنفيذ المطابقة وإنتاج PDF"):
+        client = setup_google_vision()
+        if client is None:
+            st.error("❌ تعذّر تهيئة Google Vision.")
+            st.stop()
+
+        progress = st.progress(0)
+        status = st.empty()
+
+        # سنجمع البطاقات حسب النوع
+        cards = {
+            "unified": [],  # [(name_norm, name_raw, image_bgr)]
+            "voter":  []
+        }
+        leftovers = []  # بطاقات لم يُعرف نوعها
+
+        # 1) قصّ البطاقات + OCR
+        total_files = len(imgs_cards)
+        processed = 0
+
+        for f in imgs_cards:
+            try:
+                content = _read_bytes(f)
+                # قراءة الصورة
+                file_bytes = np.asarray(bytearray(content), dtype=np.uint8)
+                img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                if img_bgr is None:
+                    st.warning(f"⚠️ تعذّر قراءة الصورة: {f.name}")
+                    continue
+
+                crops = _detect_and_crop_cards(img_bgr)
+
+                for crop_bgr in crops:
+                    # OCR
+                    png_bytes = _cv2_to_png_bytes(crop_bgr)
+                    gimg = vision.Image(content=png_bytes)
+                    resp = client.text_detection(image=gimg)
+                    texts = resp.text_annotations
+                    full_text = texts[0].description if texts else ""
+
+                    card_type = _guess_card_type(full_text)
+                    name_raw  = _extract_name_from_text(full_text)
+                    name_norm = _normalize_ar(name_raw)
+
+                    rec = (name_norm, name_raw, crop_bgr)
+
+                    if card_type in ("unified", "voter") and name_norm:
+                        cards[card_type].append(rec)
+                    else:
+                        leftovers.append(rec)
+
+            except Exception as e:
+                st.warning(f"⚠️ خطأ أثناء معالجة {f.name}: {e}")
+
+            processed += 1
+            progress.progress(processed/total_files)
+            status.text(f"معالجة الصور: {processed}/{total_files}")
+
+        # 2) المطابقة بالأسماء بين القائمتين
+        pairs = []          # [(unified_rec, voter_rec, score)]
+        unmatched_unified = []
+        unmatched_voter   = [v for v in cards["voter"]]  # سنزيل ما يُطابق لاحقًا
+
+        # فهرس سريع للأسماء في بطاقات الناخب
+        voter_names = [v[0] for v in cards["voter"]]
+
+        for u in cards["unified"]:
+            u_name_norm, u_name_raw, u_img = u
+            if not voter_names:
+                unmatched_unified.append(u)
+                continue
+
+            # أفضل تطابق
+            match, score, idx = process.extractOne(
+                u_name_norm,
+                voter_names,
+                scorer=fuzz.token_sort_ratio
+            ) if voter_names else (None, 0, None)
+
+            if match is not None and score >= 70:
+                voter_rec = cards["voter"][idx]
+                pairs.append((u, voter_rec, score))
+                # إزالة هذا الناخب من قائمة غير المطابقة
+                voter_names.pop(idx)
+                unmatched_voter.pop(idx)
+            else:
+                unmatched_unified.append(u)
+
+        # 3) إنشاء PDF: جدول عمودين (يسار: موحدة | يمين: ناخب)
+        if pairs:
+            pdf_name = "matched_cards.pdf"
+            c = canvas.Canvas(pdf_name, pagesize=A4)
+            page_w, page_h = A4
+            margin = 36  # 0.5 inch تقريبًا
+            col_gap = 24
+            row_gap = 30
+            img_max_w = (page_w - (2*margin) - col_gap) / 2.0
+            img_max_h = 220  # ارتفاع مناسب للصورة
+            text_gap = 14
+
+            def _draw_label_center(x_center, y_text, txt):
+                try:
+                    c.setFont(arabic_font, 11)
+                except:
+                    c.setFont("Helvetica", 10)
+                c.drawCentredString(x_center, y_text, fix_arabic_text(txt))
+
+            row_y = page_h - margin
+            col_left_x  = margin
+            col_right_x = margin + img_max_w + col_gap
+
+            items_in_page = 0
+            max_rows_per_page = 3  # كل صف صورتين + نصوص
+
+            for (u_norm, u_raw, u_img), (v_norm, v_raw, v_img), score in pairs:
+                # سطر جديد؟
+                if items_in_page >= max_rows_per_page:
+                    c.showPage()
+                    row_y = page_h - margin
+                    items_in_page = 0
+
+                # حساب قياسات الصورة المرسومة مع الحفاظ على النسبة
+                def _draw_img(img_bgr, x, top_y):
+                    ih, iw = img_bgr.shape[:2]
+                    scale = min(img_max_w/iw, img_max_h/ih)
+                    dw, dh = iw*scale, ih*scale
+                    # تحويل إلى ملف مؤقت PNG
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+                    Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)).save(tmp.name)
+                    c.drawImage(tmp.name, x, top_y - dh, width=dw, height=dh)
+                    os.unlink(tmp.name)
+                    return dw, dh
+
+                # يسار: البطاقة الموحدة
+                dw_u, dh_u = _draw_img(u_img, col_left_x, row_y)
+                _draw_label_center(col_left_x + dw_u/2, row_y - dh_u - text_gap, u_raw if u_raw else "—")
+
+                # يمين: بطاقة الناخب
+                dw_v, dh_v = _draw_img(v_img, col_right_x, row_y)
+                _draw_label_center(col_right_x + dw_v/2, row_y - dh_v - text_gap, v_raw if v_raw else "—")
+
+                # التالي عموديًا
+                row_y = row_y - max(dh_u, dh_v) - (text_gap + 26) - row_gap
+                items_in_page += 1
+
+            c.save()
+
+            with open(pdf_name, "rb") as f:
+                st.download_button("⬇️ تحميل PDF المطابقات", f, file_name=pdf_name, mime="application/pdf")
+
+            st.success(f"✅ تم إنشاء ملف PDF للمطابقات: عدد الصفوف = {len(pairs)}")
+        else:
+            st.warning("⚠️ لم يتم العثور على أي أزواج متطابقة بالاسم (موحّدة ↔ ناخب).")
+
+        # 4) عرض غير المطابق + المجهول
+        if unmatched_unified or unmatched_voter or leftovers:
+            st.markdown("### 🔎 بطاقات لم تُطابق / غير مُعرّفة")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.markdown("**البطاقات الوطنية غير المطابقة**")
+                for nrm, raw, img in unmatched_unified[:6]:
+                    st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption=raw or "—", use_container_width=True)
+                if len(unmatched_unified) > 6:
+                    st.info(f"+ {len(unmatched_unified)-6} أخرى...")
+            with col2:
+                st.markdown("**بطاقات الناخب غير المطابقة**")
+                for nrm, raw, img in unmatched_voter[:6]:
+                    st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption=raw or "—", use_container_width=True)
+                if len(unmatched_voter) > 6:
+                    st.info(f"+ {len(unmatched_voter)-6} أخرى...")
+            with col3:
+                st.markdown("**بطاقات غير مُعرّفة النوع/الاسم**")
+                for nrm, raw, img in leftovers[:6]:
+                    st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption=raw or "—", use_container_width=True)
+                if len(leftovers) > 6:
+                    st.info(f"+ {len(leftovers)-6} أخرى...")

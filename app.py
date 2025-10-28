@@ -425,7 +425,7 @@ from rapidfuzz import process, fuzz
 import time, pandas as pd
 import openpyxl, os, tempfile
 
-# ------------------------ أدوات التطبيع ------------------------
+# ======================= أدوات التطبيع =======================
 def normalize_ar(text: str) -> str:
     if not text:
         return ""
@@ -445,15 +445,16 @@ def normalize_fast(s: pd.Series) -> pd.Series:
     mapping = {u: normalize_ar(u) for u in uniq}
     return s.fillna("").astype(str).map(mapping)
 
-# ------------------------ تحميل انتقائي من DB ------------------------
+# ======================= تحميل انتقائي من DB =======================
 @st.cache_data(show_spinner=False)
 def load_baghdad_for_centers(centers: list) -> pd.DataFrame:
-    """يحمل فقط السجلات للمراكز المطلوبة من جدول Bagdad"""
+    """
+    يحمل فقط السجلات للمراكز المطلوبة من جدول Bagdad
+    """
     conn = get_conn()
     try:
-        # تقسيم دفعات لتجنب قوائم ضخمة في الاستعلام
-        batch_size = 800
         parts = []
+        batch_size = 800
         for i in range(0, len(centers), batch_size):
             batch = [str(c).strip() for c in centers[i:i+batch_size] if c]
             if not batch:
@@ -463,79 +464,94 @@ def load_baghdad_for_centers(centers: list) -> pd.DataFrame:
                 FROM "Bagdad"
                 WHERE CAST("اسم مركز الاقتراع" AS TEXT) = ANY(%(centers)s)
             """
-            parts.append(pd.read_sql_query(q, conn, params={"centers": batch}))
+            part = pd.read_sql_query(q, conn, params={"centers": batch})
+            if not part.empty:
+                parts.append(part)
         if parts:
             return pd.concat(parts, ignore_index=True)
         return pd.DataFrame(columns=["رقم الناخب","الاسم الثلاثي","اسم مركز الاقتراع"])
     finally:
         conn.close()
 
-# ------------------------ التنفيذ ------------------------
+# ======================= واجهة Streamlit =======================
+st.title("🔎 مطابقة الناخبين - بغداد (سريع)")
+
+file_nc = st.file_uploader("📤 ارفع ملف Excel يحتوي الاسم + اسم مركز الاقتراع", type=["xlsx"])
+run_nc = st.button("🚀 بدء البحث ومشاهدة التقدم")
+
+# حدود المطابقة
+MIN_NAME_MATCH = 60   # حد قبول تطابق الاسم
+# عندما نعمل ضمن نفس المركز نعتبر تطابق المركز = 100%
+
 if file_nc and run_nc:
     start = time.time()
     st.info("📦 جاري تجهيز البيانات...")
 
-    # 1) قراءة الملف والتحقق من الأعمدة
+    # -------- قراءة الملف والتحقق --------
     try:
         df = pd.read_excel(file_nc, engine="openpyxl")
         df.columns = df.columns.str.strip()
-        req_cols = {"الاسم","اسم مركز الاقتراع"}
-        if not req_cols.issubset(set(df.columns)):
+        if not {"الاسم", "اسم مركز الاقتراع"}.issubset(df.columns):
             st.error("❌ الملف يجب أن يحتوي على الأعمدة: الاسم واسم مركز الاقتراع")
             st.stop()
     except Exception as e:
         st.error(f"❌ خطأ في قراءة الملف: {e}")
         st.stop()
 
-    # 2) تطبيع الملف
+    total = len(df)
+    if total == 0:
+        st.warning("⚠️ الملف فارغ.")
+        st.stop()
+
+    # -------- تطبيع الملف --------
     df["__norm_name"] = normalize_fast(df["الاسم"])
     df["__norm_center"] = normalize_fast(df["اسم مركز الاقتراع"])
-    centers = df["اسم مركز الاقتراع"].dropna().astype(str).unique().tolist()
 
-    # 3) تحميل بيانات القاعدة للمراكز المطلوبة فقط
+    # -------- تحميل بيانات القاعدة للمراكز المطلوبة فقط --------
+    centers = df["اسم مركز الاقتراع"].dropna().astype(str).unique().tolist()
     db_all = load_baghdad_for_centers(centers)
     if db_all.empty:
         st.warning("⚠️ لا توجد بيانات مطابقة لهذه المراكز في قاعدة بغداد.")
         st.stop()
 
-    # 4) تطبيع القاعدة وبناء فهارس حسب المركز
+    # -------- تطبيع القاعدة وبناء فهارس --------
     db_all["__norm_name"] = normalize_fast(db_all["الاسم الثلاثي"])
     db_all["__norm_center"] = normalize_fast(db_all["اسم مركز الاقتراع"])
 
-    # قاموس: مركز -> { names(list), data(DataFrame), exact_map(dict of norm_name -> indices) }
+    # قاموس: مركز -> { names(list), data(DataFrame), exact(dict norm_name -> [indices]) }
     groups = {}
     for c, sub in db_all.groupby("__norm_center", sort=False):
         names = sub["__norm_name"].tolist()
-        data = sub[["الاسم الثلاثي","رقم الناخب","اسم مركز الاقتراع","__norm_name"]].reset_index(drop=True)
-        # فهرس مطابقات مباشرة للاسم داخل نفس المركز
-        exact_map = {}
+        data = sub[["الاسم الثلاثي", "رقم الناخب", "اسم مركز الاقتراع", "__norm_name"]].reset_index(drop=True)
+        exact = {}
         for idx, nm in enumerate(names):
-            exact_map.setdefault(nm, []).append(idx)
-        groups[c] = {"names": names, "data": data, "exact": exact_map}
+            exact.setdefault(nm, []).append(idx)
+        groups[c] = {"names": names, "data": data, "exact": exact}
 
-    # 5) واجهة التقدم (تحديث متباعد)
-    total = len(df)
+    # -------- تجهيز واجهة التقدم --------
     progress = st.progress(0)
     status = st.empty()
     log_box = st.empty()
-
-    results = []
-    MIN_NAME_MATCH = 60  # حد قبول الاسم
-    MIN_CENTER_MATCH = 80  # حد قبول المركز (عند الحاجة)
-
     st.info(f"🚀 بدء المطابقة... (عدد السجلات: {total})")
 
-    # 6) حلقة المطابقة السريعة
-    # استخدم itertuples لتقليل overhead
-    for i, row in enumerate(df.itertuples(index=False), start=1):
-        orig_name = getattr(row, df.columns.get_loc("الاسم"))
-        orig_center = getattr(row, df.columns.get_loc("اسم مركز الاقتراع"))
-        norm_name = getattr(row, df.columns.get_loc("__norm_name"))
-        norm_center = getattr(row, df.columns.get_loc("__norm_center"))
+    # فهارس الأعمدة لاستخدام itertuples(name=None)
+    cols = df.columns
+    ix_name = cols.get_loc("الاسم")
+    ix_center = cols.get_loc("اسم مركز الاقتراع")
+    ix_norm_name = cols.get_loc("__norm_name")
+    ix_norm_center = cols.get_loc("__norm_center")
+
+    results = []
+
+    # -------- حلقة المطابقة السريعة --------
+    for i, row in enumerate(df.itertuples(index=False, name=None), start=1):
+        orig_name = row[ix_name]
+        orig_center = row[ix_center]
+        norm_name = row[ix_norm_name]
+        norm_center = row[ix_norm_center]
 
         match_row = {
             "الاسم في الملف": str(orig_name),
-            "اسم مركز الاقتراع (من الملف)": str(orig_center),
             "النسبة تطابق الاسم": 0,
             "اسم من القاعدة": "—",
             "تطابق المدرسة": "—",
@@ -546,7 +562,7 @@ if file_nc and run_nc:
 
         grp = groups.get(norm_center)
         if grp:
-            # (أ) محاولة مطابقة مباشرة بالاسم داخل نفس المركز بعد التطبيع
+            # (1) مطابقة مباشرة 1:1 بعد التطبيع داخل نفس المركز
             exact_hits = grp["exact"].get(norm_name)
             if exact_hits:
                 idx = exact_hits[0]
@@ -560,8 +576,7 @@ if file_nc and run_nc:
                     "نسبة تطابق المدرسة": 100
                 })
             else:
-                # (ب) مطابقة تقريبية داخل نفس المركز فقط (تقليل هائل للحجم)
-                # استخدام workers=-1 لتفعيل كل الأنوية و score_cutoff لتسريع
+                # (2) مطابقة تقريبية داخل نفس المركز فقط (سريع جدًا)
                 scores = process.cdist(
                     [norm_name],
                     grp["names"],
@@ -569,7 +584,7 @@ if file_nc and run_nc:
                     workers=-1,
                     score_cutoff=MIN_NAME_MATCH
                 )[0]
-                if scores.size:  # قد يرجع مصفوفة فارغة إذا لم يتجاوز الحد
+                if scores.size:
                     best_idx = int(scores.argmax())
                     best_score = float(scores[best_idx])
                     if best_score >= MIN_NAME_MATCH:
@@ -578,25 +593,24 @@ if file_nc and run_nc:
                             "النسبة تطابق الاسم": round(best_score, 2),
                             "اسم من القاعدة": rec["الاسم الثلاثي"],
                             "اسم مركز الاقتراع في القاعدة": rec["اسم مركز الاقتراع"],
-                            "رقم الناخب": rec["رقم الناخب"]
+                            "رقم الناخب": rec["رقم الناخب"],
+                            "تطابق المدرسة": "✅",
+                            "نسبة تطابق المدرسة": 100
                         })
-                        # بما أننا نقارن داخل نفس المركز، نعتبره مطابقًا
-                        match_row["تطابق المدرسة"] = "✅"
-                        match_row["نسبة تطابق المدرسة"] = 100
         else:
-            # لا يوجد هذا المركز في القاعدة: يمكن اختبار fallback اختياريًا على كل القاعدة (غير مفضل)
+            # لا توجد بيانات لهذا المركز في القاعدة
             pass
 
         results.append(match_row)
 
-        # تحديث متباعد للواجهة
+        # تحديث واجهة التقدم على فترات
         if (i % 50 == 0) or (i == total):
-            progress.progress(i/total)
-            safe_name = str(orig_name) if pd.notna(orig_name) else ""
+            progress.progress(i / total)
+            safe_name = "" if pd.isna(orig_name) else str(orig_name)
             log_box.text(f"🔹 {i}/{total}: {safe_name[:25]} ...")
             status.text(f"⏱️ تمت معالجة {i}/{total} | الوقت المنقضي: {time.time() - start:.1f} ثانية")
 
-    # 7) العرض والحفظ
+    # -------- العرض والحفظ --------
     final_df = pd.DataFrame(results)
     st.dataframe(final_df, use_container_width=True, height=420)
 

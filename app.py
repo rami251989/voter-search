@@ -931,67 +931,30 @@ with tab_qr:
 
 
 
-
 # -*- coding: utf-8 -*-
-# ======================= Cards Matching → PDF (Full, Fixed Arabic & Cropping) =======================
-import io, os, re, tempfile, datetime as _dt
-from math import ceil
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+# ====================== استخراج بطاقات الناخب فقط (قص تلقائي) ======================
+import io, os, re, zipfile, tempfile
+from datetime import datetime
+from typing import List
 
 import numpy as np
 from PIL import Image
 import streamlit as st
 import cv2
 
-# reportlab
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.colors import black
-from reportlab.lib.utils import ImageReader
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.pdfbase import pdfmetrics
+st.set_page_config(page_title="استخراج بطاقات الناخب فقط", layout="wide")
+st.title("🪪 استخراج بطاقات الناخب فقط")
+st.caption("يقوم البرنامج بقصّ البطاقات تلقائيًا من الصور، ثم يرشّح ويُخرج فقط بطاقات الناخب.")
 
-# optional fuzzy
-try:
-    from rapidfuzz import fuzz
-except Exception:
-    fuzz = None
+# ------------------------ إعدادات عامّة ------------------------
+if "voter_cards" not in st.session_state:
+    st.session_state.voter_cards = []   # List[PIL.Image]
+if "zip_bytes" not in st.session_state:
+    st.session_state.zip_bytes = b""
+if "pdf_bytes" not in st.session_state:
+    st.session_state.pdf_bytes = b""
 
-# -------------------- UI --------------------
-st.set_page_config(page_title="مطابقة البطاقات → PDF", layout="wide")
-st.title("مطابقة البطاقات وإنتاج PDF")
-st.caption("قص تلقائي + إصلاح العربية + ترتيب: يسار بطاقة الناخب | يمين البطاقة الموحدة")
-
-# -------------------- Arabic shaping --------------------
-def _register_arabic_font():
-    for p in [
-        "NotoNaskhArabic-Regular.ttf",
-        "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
-        "Amiri-Regular.ttf",
-        "/usr/share/fonts/truetype/amiri/Amiri-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]:
-        try:
-            if os.path.exists(p):
-                pdfmetrics.registerFont(TTFont("ArabicUI", p))
-                return "ArabicUI"
-        except Exception:
-            pass
-    return "Helvetica"
-
-AR_FONT = _register_arabic_font()
-
-def ar(txt: str) -> str:
-    if not txt: return ""
-    try:
-        import arabic_reshaper
-        from bidi.algorithm import get_display
-        return get_display(arabic_reshaper.reshape(txt))
-    except Exception:
-        return txt
-
-# -------------------- Google Vision (optional) --------------------
+# ------------------------ OCR (اختياري) ------------------------
 def setup_google_vision():
     try:
         from google.cloud import vision
@@ -1000,12 +963,14 @@ def setup_google_vision():
         return None
 
 def ocr_text(img_pil: Image.Image, client) -> str:
+    """OCR مع تدوير تلقائي؛ يرجع نص أو فارغ إن فشل/غير مهيأ."""
     if client is None:
         return ""
     from google.cloud import vision
-    im = np.array(img_pil.convert("RGB"))
-    im = cv2.resize(im, None, fx=1.5, fy=1.5)
-    g = cv2.cvtColor(im, cv2.COLOR_RGB2GRAY)
+    arr = np.array(img_pil.convert("RGB"))
+    # تحسين بسيط للنص
+    arr = cv2.resize(arr, None, fx=1.5, fy=1.5)
+    g = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
     g = cv2.bilateralFilter(g, 11, 75, 75)
     th = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                cv2.THRESH_BINARY, 31, 10)
@@ -1015,41 +980,32 @@ def ocr_text(img_pil: Image.Image, client) -> str:
         buf = io.BytesIO()
         Image.fromarray(rot).save(buf, format="PNG")
         try:
-            resp = client.text_detection(image=vision.Image(content=buf.getvalue()))
-            if resp and resp.text_annotations:
-                txt = resp.text_annotations[0].description
+            res = client.text_detection(image=vision.Image(content=buf.getvalue()))
+            if res and res.text_annotations:
+                txt = res.text_annotations[0].description
                 if len(txt) > len(best): best = txt
         except Exception:
             pass
     return best
 
-# -------------------- helpers --------------------
-def normalize_ar_name(text: str) -> str:
+# ------------------------ أدوات نص/تصنيف ------------------------
+def _normalize_ar(text: str) -> str:
     if not text: return ""
     s = re.sub(r"[ًٌٍَُِّْـ]", "", text)
     s = s.replace("أ","ا").replace("إ","ا").replace("آ","ا")
     s = s.replace("ؤ","و").replace("ئ","ي").replace("ى","ي").replace("ة","ه")
     return re.sub(r"\s+"," ", s.strip()).lower()
 
-def extract_name(text: str) -> str:
-    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
-    for i,l in enumerate(lines):
-        if "الاسم" in l and i+1 < len(lines):
-            cand = re.sub(r"[^أ-ي\s]", "", lines[i+1]).strip()
-            if len(cand) > 5: return cand
-    arab = [re.sub(r"[^أ-ي\s]","",l).strip() for l in lines if len(l) > 5]
-    return max(arab, key=len) if arab else ""
+VOTER_KEYWORDS = [
+    "بطاقه الناخب","بطاقة الناخب","المفوضيه","الانتخابات","رقم الناخب",
+    "المركز","المحطه","البايومتريه","بايومتريه","biometric","voter"
+]
 
-def classify(text: str, fallback="unified") -> str:
-    t = normalize_ar_name(text)
-    unified = ["البطاقه الوطنيه الموحده","الهويه","وزارة الداخليه","بطاقة وطنية","البطاقه الموحده","موحده"]
-    voter   = ["بطاقة الناخب","المفوضيه","الانتخابات","المركز","المحطه","رقم الناخب","بايومتريه","البايومتريه"]
-    if any(k in t for k in unified): return "unified"
-    if any(k in t for k in voter):   return "voter"
-    if "رقم الناخب" in t: return "voter"
-    return fallback
+def is_voter_card(text: str) -> bool:
+    t = _normalize_ar(text)
+    return any(k in t for k in VOTER_KEYWORDS)
 
-# -------------------- detection & cropping --------------------
+# ------------------------ كشف/قص البطاقات ------------------------
 def order_pts(pts):
     rect = np.zeros((4,2), dtype="float32")
     s = pts.sum(axis=1); d = np.diff(pts, axis=1)
@@ -1065,224 +1021,169 @@ def four_point_warp(image, pts):
     M = cv2.getPerspectiveTransform(rect, dst)
     return cv2.warpPerspective(image, M, (maxW, maxH))
 
-def split_cards(pil_img: Image.Image) -> List[Image.Image]:
+def split_cards_bounding(pil_img: Image.Image) -> List[Image.Image]:
+    """
+    ترجع قائمة قصّات لبطاقات محتملة داخل الصورة.
+    تعمل مع صور مثل الصفحات الممسوحة (أرضية بيضاء وبطاقات ملونة).
+    """
     img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     H, W = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5,5), 0)
-    edges = cv2.Canny(gray, 40, 140)
+    edges = cv2.Canny(gray, 40, 150)
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (5,5))
     edges = cv2.dilate(edges, k, iterations=1)
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k, iterations=2)
-    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    crops = []
-    for c in cnts:
+    items = []
+    for c in contours:
         area = cv2.contourArea(c)
-        if area < 0.03*W*H or area > 0.95*W*H: 
+        if area < 0.02*W*H or area > 0.95*W*H:
             continue
         peri = cv2.arcLength(c, True)
         approx = cv2.approxPolyDP(c, 0.02*peri, True)
         x,y,w,h = cv2.boundingRect(approx)
-        ratio = w / float(h)
-        if ratio < 0.6 or ratio > 3.5: 
+        ratio = w/float(h)
+        if ratio < 0.6 or ratio > 3.6:
             continue
         if len(approx) == 4:
             warped = four_point_warp(img, approx.reshape(4,2))
-            pad = max(2, int(min(warped.shape[:2]) * 0.015))
+            pad = max(2, int(min(w,h) * 0.02))
             warped = warped[pad:-pad, pad:-pad]
-            crops.append(Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)))
+            items.append(Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)))
         else:
             crop = img[y:y+h, x:x+w]
-            crops.append(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)))
+            items.append(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)))
 
-    # رتّب من أعلى لأسفل
-    if crops:
-        boxes = []
-        for c in cnts:
+    # ترتيب من أعلى لأسفل
+    def top_of(cnt):
+        x,y,w,h = cv2.boundingRect(cnt); return y
+    contours_sorted = sorted(
+        [c for c in contours if 0.02*W*H <= cv2.contourArea(c) <= 0.95*W*H],
+        key=lambda c: top_of(c)
+    )
+    if contours_sorted and len(contours_sorted) == len(items):
+        # إذا تساووا بالعدد انقل الترتيب
+        sorted_items = []
+        idx = 0
+        for c in contours_sorted:
             area = cv2.contourArea(c)
-            if area < 0.03*W*H or area > 0.95*W*H: 
-                continue
+            if area < 0.02*W*H or area > 0.95*W*H: continue
             x,y,w,h = cv2.boundingRect(c)
             ratio = w/float(h)
-            if 0.6 <= ratio <= 3.5:
-                boxes.append((y, x, w, h))
-        order_idx = np.argsort([b[0] for b in boxes]) if boxes else list(range(len(crops)))
-        crops = [crops[i] for i in order_idx[:len(crops)]]
-    return crops if crops else [pil_img]
+            if 0.6 <= ratio <= 3.6:
+                sorted_items.append(items[idx]); idx += 1
+        if sorted_items:
+            items = sorted_items
+    return items if items else [pil_img]
 
-# -------------------- PDF layout --------------------
-PAGE_W, PAGE_H = A4
-M_LEFT, M_RIGHT, M_TOP, M_BOTTOM = 36, 36, 48, 36
-TITLE = "صورة ضوئية لمستمسكات المراقبين"
-ROWS_PER_PAGE = 4
-NUM_COL_W = 28
-GAP_TITLE = 28
-
-TABLE_X0 = M_LEFT
-TABLE_X1 = PAGE_W - M_RIGHT
-TABLE_W  = TABLE_X1 - TABLE_X0
-GRID_TOP = PAGE_H - M_TOP - GAP_TITLE
-GRID_BOT = M_BOTTOM
-GRID_H   = GRID_TOP - GRID_BOT
-ROW_H    = GRID_H / ROWS_PER_PAGE
-
-PICS_TOTAL_W = TABLE_W - NUM_COL_W
-COL_W = PICS_TOTAL_W / 2.0
-
-def draw_center(c, x, y, txt, size):
-    c.setFont(AR_FONT, size)
-    c.drawCentredString(x, y, ar(txt))
-
-def put_img(c, pil_img, x, y, w, h, pad=10):
-    if pil_img is None: return
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-    pil_img.save(tmp.name)
-    iw, ih = pil_img.size
-    max_w, max_h = max(1, w - 2*pad), max(1, h - 2*pad)
-    r = min(max_w/iw, max_h/ih)
-    nw, nh = iw*r, ih*r
-    c.drawImage(ImageReader(tmp.name), x + (w-nw)/2, y + (h-nh)/2, nw, nh, preserveAspectRatio=True, mask='auto')
-
-def draw_pdf_page(c, pairs_chunk):
-    draw_center(c, PAGE_W/2, PAGE_H - M_TOP, TITLE, 14)
-    # Grid
-    c.setStrokeColor(black); c.setLineWidth(1)
-    c.rect(TABLE_X0, GRID_BOT, PICS_TOTAL_W, GRID_H)
-    c.rect(TABLE_X0 + PICS_TOTAL_W, GRID_BOT, NUM_COL_W, GRID_H)
-    c.line(TABLE_X0 + COL_W, GRID_BOT, TABLE_X0 + COL_W, GRID_TOP)
-    for i in range(1, ROWS_PER_PAGE):
-        y = GRID_TOP - i*ROW_H
-        c.line(TABLE_X0, y, TABLE_X0 + PICS_TOTAL_W + NUM_COL_W, y)
-    # headers
-    draw_center(c, TABLE_X0 + COL_W/2, GRID_TOP + 10, "صورة من الوجه الأول لبطاقة الناخب البايومترية", 12)
-    draw_center(c, TABLE_X0 + COL_W + COL_W/2, GRID_TOP + 10, "صورة من الوجه الأول للبطاقة الموحدة", 12)
-
-    # rows
-    for r in range(ROWS_PER_PAGE):
-        y0 = GRID_TOP - (r+1)*ROW_H
-        draw_center(c, TABLE_X0 + PICS_TOTAL_W + NUM_COL_W/2, y0 + ROW_H/2 - 6, str(r+1), 14)
-        pr = pairs_chunk[r] if r < len(pairs_chunk) else {"voter":None, "unified":None}
-        # يسار = الناخب | يمين = الموحدة
-        put_img(c, pr.get("voter"),   TABLE_X0,           y0, COL_W, ROW_H)
-        put_img(c, pr.get("unified"), TABLE_X0 + COL_W,   y0, COL_W, ROW_H)
-
-def build_pdf_bytes(pairs: List[dict]) -> bytes:
-    pages = ceil(len(pairs)/ROWS_PER_PAGE) if pairs else 1
+# ------------------------ حفظ ZIP / PDF ------------------------
+def build_zip(images: List[Image.Image]) -> bytes:
     buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    for p in range(pages):
-        chunk = pairs[p*ROWS_PER_PAGE:(p+1)*ROWS_PER_PAGE]
-        draw_pdf_page(c, chunk)
-        c.showPage()
-    c.save()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for i, im in enumerate(images, 1):
+            tmp = io.BytesIO()
+            im.save(tmp, format="JPEG", quality=95)
+            z.writestr(f"voter_{i:03d}.jpg", tmp.getvalue())
     buf.seek(0)
     return buf.getvalue()
 
-# -------------------- UI: uploader + options --------------------
-if "cards_pdf_bytes" not in st.session_state:
-    st.session_state.cards_pdf_bytes = b""
-    st.session_state.cards_pdf_name  = "matched_cards.pdf"
-
-uploads = st.file_uploader("📤 ارفع صور (JPG/PNG). يمكن أن تحتوي الصورة على عدة بطاقات.", type=["jpg","jpeg","png"], accept_multiple_files=True)
-
-if uploads:
-    st.session_state["files"] = [{"name": f.name, "bytes": f.read()} for f in uploads]
-    st.success(f"تم حفظ {len(uploads)} صورة.")
-
-col1, col2, col3 = st.columns(3)
-with col1:
-    min_match = st.slider("🔎 الحد الأدنى لتطابق الاسم (%)", 50, 100, 70, 1)
-with col2:
-    add_unmatched = st.checkbox("إدراج غير المطابقين", value=True)
-with col3:
-    show_crops = st.checkbox("👀 عرض القصّات", value=False)
-
-st.divider()
-
-# -------------------- RUN --------------------
-if st.button("🚀 معالجة الصور وتوليد PDF", use_container_width=True):
-    if not st.session_state.get("files"):
-        st.warning("⚠️ ارفع صور أولًا.")
+def build_pdf(images: List[Image.Image]) -> bytes:
+    if not images:
+        return b""
+    # استخدم PIL لحفظ PDF متعدد الصفحات
+    rgb = [im.convert("RGB") for im in images]
+    buf = io.BytesIO()
+    if len(rgb) == 1:
+        rgb[0].save(buf, format="PDF", resolution=300.0)
     else:
-        client = setup_google_vision()
-        if client is None:
-            st.info("ℹ️ Google Vision غير مهيّأ — سنكمل بدون OCR (تصنيف تقريبي).")
+        rgb[0].save(buf, format="PDF", save_all=True, append_images=rgb[1:], resolution=300.0)
+    buf.seek(0)
+    return buf.getvalue()
 
-        unified, voter = [], []
-        all_crops_dbg = []
+# ------------------------ واجهة المستخدم ------------------------
+st.markdown("### 1) ارفع الصور")
+uploaded = st.file_uploader("ارفع صور JPG/PNG — يمكن أن تحتوي الصورة الواحدة على عدة بطاقات", type=["jpg","jpeg","png"], accept_multiple_files=True)
 
-        for item in st.session_state["files"]:
-            pil = Image.open(io.BytesIO(item["bytes"])).convert("RGB")
-            crops = split_cards(pil)  # قص تلقائي
-            all_crops_dbg.extend(crops)
+st.markdown("### 2) خيارات")
+col1, col2 = st.columns(2)
+with col1:
+    show_crops = st.checkbox("عرض معاينة القصّ", value=True)
+with col2:
+    use_ocr = st.checkbox("استخدام OCR (Google Vision) لتمييز الناخب فقط", value=True)
 
-            for card in crops:
-                txt = ocr_text(card, client) if client else ""
-                nm  = extract_name(txt) if txt else ""
-                typ = classify(txt, fallback="unified" if card.size[0] >= card.size[1] else "voter")
-                rec = {"name": nm, "name_norm": normalize_ar_name(nm), "img": card, "text": txt}
-                (unified if typ=="unified" else voter).append(rec)
+st.markdown("### 3) تنفيذ")
 
-        if show_crops and all_crops_dbg:
-            st.info("نتائج القصّ:")
-            cols = st.columns(4)
-            for i, cp in enumerate(all_crops_dbg[:12]):
-                cols[i%4].image(cp, use_column_width=True)
+if st.button("🚀 قصّ الصور واستخراج **بطاقات الناخب** فقط"):
+    if not uploaded:
+        st.warning("⚠️ رجاءً ارفع صور أولًا.")
+    else:
+        st.session_state.voter_cards = []
+        client = setup_google_vision() if use_ocr else None
+        if use_ocr and client is None:
+            st.info("ℹ️ لم يتم تهيئة Google Vision — سيتم المتابعة بدون OCR (قد تمر بعض غير الناخب).")
 
-        # -------- pairing --------
-        pairs = []
-        used = set()
-        if fuzz and unified and voter:
-            vnames = [normalize_ar_name(v["name"]) for v in voter]
-            for u in unified:
-                n = normalize_ar_name(u["name"])
-                if not n:
-                    pairs.append({"voter": None, "unified": u["img"]}); continue
-                sc = [fuzz.ratio(n, vn) for vn in vnames] if vnames else []
-                if sc:
-                    idx = int(np.argmax(sc)); score = int(sc[idx])
+        progress = st.progress(0.0)
+        total = len(uploaded)
+
+        for i, f in enumerate(uploaded, 1):
+            img = Image.open(io.BytesIO(f.read())).convert("RGB")
+            crops = split_cards_bounding(img)
+
+            if show_crops:
+                st.caption(f"📎 القصّات من: {f.name}")
+                cols = st.columns(min(4, max(1, len(crops))))
+                for j, cp in enumerate(crops):
+                    cols[j % len(cols)].image(cp, use_column_width=True)
+
+            for cp in crops:
+                txt = ocr_text(cp, client) if client else ""
+                if client is not None:
+                    # OCR متاح → نفلتر حصراً بالنص
+                    if is_voter_card(txt): 
+                        st.session_state.voter_cards.append(cp)
                 else:
-                    idx, score = -1, 0
-                if score >= min_match and idx not in used:
-                    pairs.append({"voter": voter[idx]["img"], "unified": u["img"]}); used.add(idx)
-                else:
-                    pairs.append({"voter": None, "unified": u["img"]})
-            if add_unmatched:
-                for i,v in enumerate(voter):
-                    if i not in used:
-                        pairs.append({"voter": v["img"], "unified": None})
-        else:
-            # Fallback: رصّها حسب الارتفاع (فوق لتحت) ثم زوج كل اثنين
-            tmp = []
-            for u in unified: tmp.append(("unified", u["img"]))
-            for v in voter:   tmp.append(("voter",   v["img"]))
-            if not tmp:
-                tmp = [("voter", im) for im in all_crops_dbg]  # لو ما قدر يصنّف
-            # اضمن أن الناخب يسار والموحّدة يمين في كل صف
-            row = {"voter": None, "unified": None}
-            for t,im in tmp:
-                row[t] = im if row[t] is None else row[t]
-                if row["voter"] or row["unified"]:
-                    if row["voter"] and row["unified"]:
-                        pairs.append(row); row = {"voter": None, "unified": None}
-            if row["voter"] or row["unified"]:
-                pairs.append(row)
+                    # بدون OCR → فلترة مبدئية: اعتبر أنها بطاقة ناخب إذا أبعادها أفقية أكثر وقرب لونها للأخضر المزرق الشائع
+                    w,h = cp.size
+                    ratio = w/float(h)
+                    # فحص درجة اللون الأخضر/الأزرق بشكل بسيط
+                    arr = np.array(cp.resize((64,40)))  # تصغير للسرعة
+                    mean = arr.mean(axis=(0,1))  # BGR تقريباً (هنا RGB)
+                    greenish = (mean[1] > mean[0]*0.9 and mean[1] > mean[2]*0.9)
+                    if 1.2 <= ratio <= 2.5 and greenish:
+                        st.session_state.voter_cards.append(cp)
 
-        if not pairs:
-            st.error("لم يتم العثور على بطاقات بعد القص.")
-        else:
-            pdf_bytes = build_pdf_bytes(pairs)
-            st.session_state.cards_pdf_bytes = pdf_bytes
-            st.session_state.cards_pdf_name  = f"matched_cards_{_dt.datetime.now():%Y%m%d_%H%M%S}.pdf"
-            st.success(f"✅ تم إنشاء PDF. الصفحات: {ceil(len(pairs)/ROWS_PER_PAGE)}")
+            progress.progress(i/total)
 
-# -------------------- Download --------------------
-if st.session_state.cards_pdf_bytes:
-    st.download_button(
-        "⬇️ تحميل PDF",
-        data=st.session_state.cards_pdf_bytes,
-        file_name=st.session_state.cards_pdf_name,
-        mime="application/pdf",
-        use_container_width=True
-    )
+        st.success(f"✅ تم استخراج {len(st.session_state.voter_cards)} بطاقة ناخب.")
+
+        # جهّز التنزيلات
+        st.session_state.zip_bytes = build_zip(st.session_state.voter_cards) if st.session_state.voter_cards else b""
+        st.session_state.pdf_bytes = build_pdf(st.session_state.voter_cards) if st.session_state.voter_cards else b""
+
+# ------------------------ تنزيل + معاينة ------------------------
+if st.session_state.voter_cards:
+    st.markdown("### 4) تنزيل النتائج")
+    colz1, colz2 = st.columns(2)
+    with colz1:
+        st.download_button(
+            "⬇️ تنزيل الصور كـ ZIP",
+            data=st.session_state.zip_bytes,
+            file_name=f"voter_cards_{datetime.now():%Y%m%d_%H%M%S}.zip",
+            mime="application/zip",
+            use_container_width=True
+        )
+    with colz2:
+        st.download_button(
+            "⬇️ تنزيل PDF للقصّات",
+            data=st.session_state.pdf_bytes,
+            file_name=f"voter_cards_{datetime.now():%Y%m%d_%H%M%S}.pdf",
+            mime="application/pdf",
+            use_container_width=True
+        )
+
+    st.markdown("### 👀 معاينة سريعة")
+    cols = st.columns(4)
+    for i, im in enumerate(st.session_state.voter_cards[:12]):
+        cols[i % 4].image(im, use_column_width=True)

@@ -416,14 +416,12 @@ with tab_file:
 # ----------------------------------------------------------------------------- #
 # 4️⃣ التبويب الرابع: البحث الذكي بالاسم + مركز الاقتراع (Bagdad)
 # ----------------------------------------------------------------------------- #
-with tab_file_name_center:
-    st.subheader("🔎 البحث الذكي (اسم + مركز اقتراع) ⚡")
-file_nc = st.file_uploader("📤 ارفع ملف Excel يحتوي الاسم + اسم مركز الاقتراع", type=["xlsx"])
-run_nc = st.button("🚀 بدء البحث ومشاهدة التقدم")
-
+import streamlit as st
+import pandas as pd
+import time, tempfile, openpyxl, os
 from rapidfuzz import process, fuzz
-import time, pandas as pd
-import openpyxl, os, tempfile
+
+# from your_module import get_conn  # تأكد من وجودها
 
 # ======================= أدوات التطبيع =======================
 def normalize_ar(text: str) -> str:
@@ -448,9 +446,6 @@ def normalize_fast(s: pd.Series) -> pd.Series:
 # ======================= تحميل انتقائي من DB =======================
 @st.cache_data(show_spinner=False)
 def load_baghdad_for_centers(centers: list) -> pd.DataFrame:
-    """
-    يحمل فقط السجلات للمراكز المطلوبة من جدول Bagdad
-    """
     conn = get_conn()
     try:
         parts = []
@@ -476,18 +471,21 @@ def load_baghdad_for_centers(centers: list) -> pd.DataFrame:
 # ======================= واجهة Streamlit =======================
 st.title("🔎 مطابقة الناخبين - بغداد (سريع)")
 
-file_nc = st.file_uploader("📤 ارفع ملف Excel يحتوي الاسم + اسم مركز الاقتراع", type=["xlsx"])
-run_nc = st.button("🚀 بدء البحث ومشاهدة التقدم")
+# 🔑 أعطِ مفاتيح فريدة لتجنب التصادم مع شاشات/صفحات/أقسام أخرى
+file_nc = st.file_uploader(
+    "📤 ارفع ملف Excel يحتوي الاسم + اسم مركز الاقتراع",
+    type=["xlsx"],
+    key="baghdad_file_uploader_v1"
+)
+run_nc = st.button("🚀 بدء البحث ومشاهدة التقدم", key="baghdad_run_btn_v1")
 
-# حدود المطابقة
-MIN_NAME_MATCH = 60   # حد قبول تطابق الاسم
-# عندما نعمل ضمن نفس المركز نعتبر تطابق المركز = 100%
+MIN_NAME_MATCH = 60
 
 if file_nc and run_nc:
     start = time.time()
     st.info("📦 جاري تجهيز البيانات...")
 
-    # -------- قراءة الملف والتحقق --------
+    # -------- قراءة الملف --------
     try:
         df = pd.read_excel(file_nc, engine="openpyxl")
         df.columns = df.columns.str.strip()
@@ -507,18 +505,17 @@ if file_nc and run_nc:
     df["__norm_name"] = normalize_fast(df["الاسم"])
     df["__norm_center"] = normalize_fast(df["اسم مركز الاقتراع"])
 
-    # -------- تحميل بيانات القاعدة للمراكز المطلوبة فقط --------
+    # -------- تحميل من القاعدة للمراكز فقط --------
     centers = df["اسم مركز الاقتراع"].dropna().astype(str).unique().tolist()
     db_all = load_baghdad_for_centers(centers)
     if db_all.empty:
         st.warning("⚠️ لا توجد بيانات مطابقة لهذه المراكز في قاعدة بغداد.")
         st.stop()
 
-    # -------- تطبيع القاعدة وبناء فهارس --------
+    # -------- تطبيع القاعدة + فهارس --------
     db_all["__norm_name"] = normalize_fast(db_all["الاسم الثلاثي"])
     db_all["__norm_center"] = normalize_fast(db_all["اسم مركز الاقتراع"])
 
-    # قاموس: مركز -> { names(list), data(DataFrame), exact(dict norm_name -> [indices]) }
     groups = {}
     for c, sub in db_all.groupby("__norm_center", sort=False):
         names = sub["__norm_name"].tolist()
@@ -528,13 +525,12 @@ if file_nc and run_nc:
             exact.setdefault(nm, []).append(idx)
         groups[c] = {"names": names, "data": data, "exact": exact}
 
-    # -------- تجهيز واجهة التقدم --------
+    # -------- واجهة التقدم --------
     progress = st.progress(0)
     status = st.empty()
     log_box = st.empty()
     st.info(f"🚀 بدء المطابقة... (عدد السجلات: {total})")
 
-    # فهارس الأعمدة لاستخدام itertuples(name=None)
     cols = df.columns
     ix_name = cols.get_loc("الاسم")
     ix_center = cols.get_loc("اسم مركز الاقتراع")
@@ -543,7 +539,7 @@ if file_nc and run_nc:
 
     results = []
 
-    # -------- حلقة المطابقة السريعة --------
+    # -------- حلقة المطابقة --------
     for i, row in enumerate(df.itertuples(index=False, name=None), start=1):
         orig_name = row[ix_name]
         orig_center = row[ix_center]
@@ -562,7 +558,6 @@ if file_nc and run_nc:
 
         grp = groups.get(norm_center)
         if grp:
-            # (1) مطابقة مباشرة 1:1 بعد التطبيع داخل نفس المركز
             exact_hits = grp["exact"].get(norm_name)
             if exact_hits:
                 idx = exact_hits[0]
@@ -576,10 +571,8 @@ if file_nc and run_nc:
                     "نسبة تطابق المدرسة": 100
                 })
             else:
-                # (2) مطابقة تقريبية داخل نفس المركز فقط (سريع جدًا)
                 scores = process.cdist(
-                    [norm_name],
-                    grp["names"],
+                    [norm_name], grp["names"],
                     scorer=fuzz.token_sort_ratio,
                     workers=-1,
                     score_cutoff=MIN_NAME_MATCH
@@ -597,13 +590,9 @@ if file_nc and run_nc:
                             "تطابق المدرسة": "✅",
                             "نسبة تطابق المدرسة": 100
                         })
-        else:
-            # لا توجد بيانات لهذا المركز في القاعدة
-            pass
 
         results.append(match_row)
 
-        # تحديث واجهة التقدم على فترات
         if (i % 50 == 0) or (i == total):
             progress.progress(i / total)
             safe_name = "" if pd.isna(orig_name) else str(orig_name)
@@ -612,15 +601,15 @@ if file_nc and run_nc:
 
     # -------- العرض والحفظ --------
     final_df = pd.DataFrame(results)
-    st.dataframe(final_df, use_container_width=True, height=420)
+    st.dataframe(final_df, use_container_width=True, height=420, key="baghdad_table_v1")
 
     out_file = "نتائج_البحث_الذكي.xlsx"
     final_df.to_excel(out_file, index=False)
 
     with open(out_file, "rb") as f:
-        st.download_button("⬇️ تحميل النتائج", f, file_name=out_file)
+        st.download_button("⬇️ تحميل النتائج", f, file_name=out_file, key="baghdad_download_final_v1")
 
-    st.success(f"✅ اكتمل البحث في {time.time() - start:.1f} ثانية")
+    st.success(f"✅ اكتمل البحث في {time.time() - start:.1f} ثانية", icon="✅")
 
 # ----------------------------------------------------------------------------- #
 # 5) 📦 عدّ البطاقات (أرقام 8 خانات) + بحث في القاعدة + قائمة الأرقام غير الموجودة

@@ -1087,42 +1087,40 @@ with tab_cards_pdf:
             for i,v in enumerate(voter):
                 if i not in used: pairs.append({"unified":None,"voter":v,"score":0})
 
-       # ------------ توليد PDF بشكل مطابق للعينة ------------
-pdf_name = "matched_cards.pdf"
-c = canvas.Canvas(pdf_name, pagesize=A4)
+      # ====================== توليد PDF بشكل مطابق + صور جنب بعض ======================
+import io, tempfile
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from PIL import Image
+
+# ---- إعدادات الصفحة والهوامش ----
 page_w, page_h = A4
-
-# إعدادات الهوامش والشبكة
-M_LEFT   = 36
-M_RIGHT  = 36
-M_TOP    = 48
-M_BOTTOM = 36
-
+M_LEFT, M_RIGHT, M_TOP, M_BOTTOM = 36, 36, 48, 36
 TITLE = "صورة ضوئية لمستمسكات المراقبين"
-NUM_COL_W = 28  # عرض عمود الأرقام يميناً
-GAP_TITLE = 28
+NUM_COL_W = 28       # عرض عمود الأرقام (يمين)
+GAP_TITLE = 28       # مسافة بين العنوان وبداية الجدول
+rows_per_page = 4
 
-# منطقة الجدول (تحت العنوان)
+# منطقة الجدول
 table_x0 = M_LEFT
 table_x1 = page_w - M_RIGHT
 table_w  = table_x1 - table_x0
 grid_top = page_h - M_TOP - GAP_TITLE
 grid_bot = M_BOTTOM
 grid_h   = grid_top - grid_bot
+row_h    = grid_h / rows_per_page
 
-rows_per_page = 4
-row_h = grid_h / rows_per_page
-
-# عرض عمودين للصور + عمود أرقام يميناً
+# عرض عمودي الصور (يسار=ناخب، يمين=موحدة)
 pics_total_w = table_w - NUM_COL_W
 col_w = pics_total_w / 2.0
 
+# ---- دوال مساعدة ----
 def _draw_centered_ar(c, x, y, text, font=arabic_font, size=12):
     c.setFont(font, size)
     c.drawCentredString(x, y, fix_arabic_text(text))
 
 def _scale_and_draw_image_box(c, path, x, y, w, h, pad=10):
-    # يرسم الصورة داخل الصندوق (x,y) أسفل-يسار، مع حواف داخلية بسيطة
+    """يرسم الصورة في الصندوق (x,y) أسفل-يسار مع المحافظة على النسبة."""
     from reportlab.lib.utils import ImageReader
     img = Image.open(path); iw, ih = img.size
     max_w = max(1, w - 2*pad)
@@ -1135,90 +1133,83 @@ def _scale_and_draw_image_box(c, path, x, y, w, h, pad=10):
                 preserveAspectRatio=True, mask='auto')
 
 def _draw_grid_page(c, page_pairs):
-    # عنوان الصفحة
-    c.setFont(arabic_font, 14)
-    _draw_centered_ar(c, page_w/2, page_h - M_TOP, TITLE)
+    # عنوان
+    _draw_centered_ar(c, page_w/2, page_h - M_TOP, TITLE, size=14)
 
-    # رسم الإطار الخارجي للجدول
+    # إطار الأعمدة (صور + أرقام)
     c.setLineWidth(1)
-    # المستطيل الرئيسي: عمودين صور + عمود أرقام
-    c.rect(table_x0, grid_bot, pics_total_w, grid_h)          # إطار عمودي للصور
-    c.rect(table_x0 + pics_total_w, grid_bot, NUM_COL_W, grid_h)  # عمود الأرقام يميناً
+    c.rect(table_x0, grid_bot, pics_total_w, grid_h)                 # إطار عمودي الصور
+    c.rect(table_x0 + pics_total_w, grid_bot, NUM_COL_W, grid_h)     # عمود الأرقام يميناً
 
-    # خطوط عمودية فاصلة بين العمودين (يمين = الموحدة / يسار = الناخب)
-    # ترتيب الأعمدة من اليسار لليمين: [الناخب][الموحدة][الأرقام]
-    c.line(table_x0 + col_w, grid_bot, table_x0 + col_w, grid_top)  # فاصلة وسط عمودي الصور
+    # خط فاصل بين عمودي الصور (يسار/يمين)
+    c.line(table_x0 + col_w, grid_bot, table_x0 + col_w, grid_top)
 
     # خطوط أفقية للصفوف
     for i in range(1, rows_per_page):
         y = grid_top - i*row_h
         c.line(table_x0, y, table_x0 + pics_total_w + NUM_COL_W, y)
 
-    # التسميات أعلى العمودين (اختياري لكنها مطابقة لروح العينة)
-    c.setFont(arabic_font, 12)
-    _draw_centered_ar(c, table_x0 + (col_w/2), grid_top + 10, "صورة من الوجه الأول لبطاقة الناخب البايومترية")
-    _draw_centered_ar(c, table_x0 + col_w + (col_w/2), grid_top + 10, "صورة من الوجه الأول للبطاقة الموحدة")
+    # التسميات أعلى الأعمدة (اختياري – مطابقة للعيّنة)
+    _draw_centered_ar(c, table_x0 + (col_w/2),        grid_top + 10,
+                      "صورة من الوجه الأول لبطاقة الناخب البايومترية")
+    _draw_centered_ar(c, table_x0 + col_w + (col_w/2), grid_top + 10,
+                      "صورة من الوجه الأول للبطاقة الموحدة")
 
-    # تعبئة الصفوف بالصور + أرقام ١..٤
+    # تعبئة الصفوف بالصور جنب بعض + الأرقام
     for r in range(rows_per_page):
-        # حدود خلية هذا الصف
         y0 = grid_top - (r+1)*row_h
-        # مربعات الصور:
-        # يسار: الناخب  | يمين: الموحّدة
-        voter_box_x = table_x0
-        voter_box_y = y0
-        unified_box_x = table_x0 + col_w
-        unified_box_y = y0
 
-        # رقم الصف في عمود الأرقام (يمين)
-        c.setFont(arabic_font, 14)
+        # رقم الصف في العمود الجانبي
         num_center_x = table_x0 + pics_total_w + (NUM_COL_W/2)
         num_center_y = y0 + row_h/2 - 6
-        _draw_centered_ar(c, num_center_x, num_center_y, str(r+1))
+        _draw_centered_ar(c, num_center_x, num_center_y, str(r+1), size=14)
 
-        # ضع الصور إن وجدت
         pr = page_pairs[r] if r < len(page_pairs) else {"unified": None, "voter": None}
+
         def save_tmp(img):
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
             img.save(tmp.name); return tmp.name
 
+        # مواضع الصندوقين في نفس الصف:
+        # يسار = بطاقة الناخب، يمين = البطاقة الموحدة
+        voter_box_x   = table_x0 + 5
+        unified_box_x = table_x0 + col_w + 5
+        y_box         = y0 + 5
+        w_box         = col_w - 10
+        h_box         = row_h - 10
+
+        # الناخب (يسار)
         if pr.get("voter") and pr["voter"].get("img"):
             v_path = save_tmp(pr["voter"]["img"])
-            _scale_and_draw_image_box(c, v_path, voter_box_x, voter_box_y, col_w, row_h)
+            _scale_and_draw_image_box(c, v_path, voter_box_x, y_box, w_box, h_box)
+
+        # الموحدة (يمين)
         if pr.get("unified") and pr["unified"].get("img"):
             u_path = save_tmp(pr["unified"]["img"])
-            _scale_and_draw_image_box(c, u_path, unified_box_x, unified_box_y, col_w, row_h)
+            _scale_and_draw_image_box(c, u_path, unified_box_x, y_box, w_box, h_box)
 
-# تقسيم الأزواج إلى صفحات (كل صفحة 4 صفوف)
+# ---- تقسيم الأزواج إلى صفحات ورسمها في بافر الذاكرة ----
 from math import ceil
 pages = ceil(len(pairs) / rows_per_page) if len(pairs) else 1
-for p in range(pages):
-    chunk = pairs[p*rows_per_page:(p+1)*rows_per_page]
-    # مهم: نضمن أن العمود الأيمن هو "الموحدة" والأيسر "الناخب"
-    # pairs لدينا حالياً بالشكل {"unified":..., "voter":...} بالفعل
-    _draw_grid_page(c, chunk)
-    c.showPage()
 
-c.save()
-# ==== تصدير الـPDF إلى BytesIO ثم إتاحة التنزيل ====
 buf = io.BytesIO()
 c = canvas.Canvas(buf, pagesize=A4)
 
-# ... ارسم الصفحات هنا كما هو في كودك (نفس _draw_grid_page والـloop) ...
 for p in range(pages):
     chunk = pairs[p*rows_per_page:(p+1)*rows_per_page]
     _draw_grid_page(c, chunk)
     c.showPage()
 
 c.save()
-buf.seek(0)  # مهم!
+buf.seek(0)
 
-file_name = f"matched_cards.pdf"  # أو أضف طابع زمني إن حبيت
+# ---- زر تنزيل الملف ----
 st.download_button(
     "⬇️ تحميل PDF الناتج",
     data=buf,
-    file_name=file_name,
+    file_name="matched_cards.pdf",
     mime="application/pdf",
     key="download_cards_pdf"
 )
 st.success("✅ تم إنشاء ملف PDF النهائي بنجاح.")
+# =============================================================================== 

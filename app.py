@@ -930,141 +930,104 @@ with tab_qr:
                 st.error(f"❌ حدث خطأ أثناء إنشاء PDF: {e}")
 
 
+# -*- coding: utf-8 -*-
+import cv2
+import numpy as np
+import io, tempfile, math
+import streamlit as st
+from PIL import Image
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from itertools import zip_longest
 
+st.set_page_config(page_title="مطابقة البطاقات PDF", layout="wide")
+st.title("مطابقة البطاقات مع القصّ الذكي")
 
+if "files" not in st.session_state:
+    st.session_state.files = []
+if "pdf" not in st.session_state:
+    st.session_state.pdf = b""
 
-   # ------------ توليد PDF بشكل مطابق للعينة ------------
-pdf_name = "matched_cards.pdf"
-c = canvas.Canvas(pdf_name, pagesize=A4)
+files = st.file_uploader("📤 ارفع صور البطاقات", accept_multiple_files=True)
+if files:
+    st.session_state.files = [{"name": f.name, "bytes": f.read()} for f in files]
+    st.success(f"تم تحميل {len(files)} صور ✅")
+
+def smart_crop(img: Image.Image):
+    """قص ذكي باستخدام OpenCV لعزل البطاقة من الورقة البيضاء"""
+    opencv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(opencv, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
+    cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts: return img
+    c = max(cnts, key=cv2.contourArea)
+    x,y,w,h = cv2.boundingRect(c)
+    cropped = opencv[y:y+h, x:x+w]
+    return Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
+
+rows_per_page = 4
 page_w, page_h = A4
-
-# إعدادات الهوامش والشبكة
-M_LEFT   = 36
-M_RIGHT  = 36
-M_TOP    = 48
-M_BOTTOM = 36
-
-TITLE = "صورة ضوئية لمستمسكات المراقبين"
-NUM_COL_W = 28  # عرض عمود الأرقام يميناً
+M_LEFT, M_RIGHT, M_TOP, M_BOTTOM = 36,36,48,36
+NUM_COL_W = 28
 GAP_TITLE = 28
 
-# منطقة الجدول (تحت العنوان)
 table_x0 = M_LEFT
 table_x1 = page_w - M_RIGHT
 table_w  = table_x1 - table_x0
 grid_top = page_h - M_TOP - GAP_TITLE
 grid_bot = M_BOTTOM
 grid_h   = grid_top - grid_bot
-
-rows_per_page = 4
 row_h = grid_h / rows_per_page
-
-# عرض عمودين للصور + عمود أرقام يميناً
 pics_total_w = table_w - NUM_COL_W
 col_w = pics_total_w / 2.0
 
-def _draw_centered_ar(c, x, y, text, font=arabic_font, size=12):
-    c.setFont(font, size)
-    c.drawCentredString(x, y, fix_arabic_text(text))
-
-def _scale_and_draw_image_box(c, path, x, y, w, h, pad=10):
-    # يرسم الصورة داخل الصندوق (x,y) أسفل-يسار، مع حواف داخلية بسيطة
-    from reportlab.lib.utils import ImageReader
-    img = Image.open(path); iw, ih = img.size
-    max_w = max(1, w - 2*pad)
-    max_h = max(1, h - 2*pad)
-    r = min(max_w/iw, max_h/ih)
-    nw, nh = iw*r, ih*r
-    c.drawImage(ImageReader(path),
-                x + (w - nw)/2, y + (h - nh)/2,
-                nw, nh,
-                preserveAspectRatio=True, mask='auto')
-
-def _draw_grid_page(c, page_pairs):
-    # عنوان الصفحة
-    c.setFont(arabic_font, 14)
-    _draw_centered_ar(c, page_w/2, page_h - M_TOP, TITLE)
-
-    # رسم الإطار الخارجي للجدول
-    c.setLineWidth(1)
-    # المستطيل الرئيسي: عمودين صور + عمود أرقام
-    c.rect(table_x0, grid_bot, pics_total_w, grid_h)          # إطار عمودي للصور
-    c.rect(table_x0 + pics_total_w, grid_bot, NUM_COL_W, grid_h)  # عمود الأرقام يميناً
-
-    # خطوط عمودية فاصلة بين العمودين (يمين = الموحدة / يسار = الناخب)
-    # ترتيب الأعمدة من اليسار لليمين: [الناخب][الموحدة][الأرقام]
-    c.line(table_x0 + col_w, grid_bot, table_x0 + col_w, grid_top)  # فاصلة وسط عمودي الصور
-
-    # خطوط أفقية للصفوف
+def draw_page(c, chunk):
+    c.setFont("Helvetica", 14)
+    c.drawCentredString(page_w/2, page_h-M_TOP, "صورة ضوئية لمستمسكات المراقبين")
+    c.rect(table_x0, grid_bot, pics_total_w, grid_h)
+    c.rect(table_x0+pics_total_w, grid_bot, NUM_COL_W, grid_h)
+    c.line(table_x0+col_w, grid_bot, table_x0+col_w, grid_top)
     for i in range(1, rows_per_page):
         y = grid_top - i*row_h
-        c.line(table_x0, y, table_x0 + pics_total_w + NUM_COL_W, y)
+        c.line(table_x0, y, table_x0+pics_total_w+NUM_COL_W, y)
+    c.drawCentredString(table_x0+col_w/2, grid_top+10, "صورة بطاقة الناخب")
+    c.drawCentredString(table_x0+col_w+col_w/2, grid_top+10, "صورة البطاقة الموحدة")
 
-    # التسميات أعلى العمودين (اختياري لكنها مطابقة لروح العينة)
-    c.setFont(arabic_font, 12)
-    _draw_centered_ar(c, table_x0 + (col_w/2), grid_top + 10, "صورة من الوجه الأول لبطاقة الناخب البايومترية")
-    _draw_centered_ar(c, table_x0 + col_w + (col_w/2), grid_top + 10, "صورة من الوجه الأول للبطاقة الموحدة")
-
-    # تعبئة الصفوف بالصور + أرقام ١..٤
     for r in range(rows_per_page):
-        # حدود خلية هذا الصف
         y0 = grid_top - (r+1)*row_h
-        # مربعات الصور:
-        # يسار: الناخب  | يمين: الموحّدة
-        voter_box_x = table_x0
-        voter_box_y = y0
-        unified_box_x = table_x0 + col_w
-        unified_box_y = y0
-
-        # رقم الصف في عمود الأرقام (يمين)
-        c.setFont(arabic_font, 14)
-        num_center_x = table_x0 + pics_total_w + (NUM_COL_W/2)
-        num_center_y = y0 + row_h/2 - 6
-        _draw_centered_ar(c, num_center_x, num_center_y, str(r+1))
-
-        # ضع الصور إن وجدت
-        pr = page_pairs[r] if r < len(page_pairs) else {"unified": None, "voter": None}
-        def save_tmp(img):
+        pr = chunk[r] if r < len(chunk) else (None,None)
+        c.drawCentredString(table_x0+pics_total_w+NUM_COL_W/2, y0+row_h/2, str(r+1))
+        def paste(img, x,y,w,h):
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-            img.save(tmp.name); return tmp.name
+            img.save(tmp.name)
+            iw, ih = img.size
+            s=min((w-20)/iw,(h-20)/ih)
+            nw,nh=iw*s,ih*s
+            c.drawImage(tmp.name,x+(w-nw)/2,y+(h-nh)/2,nw,nh)
 
-        if pr.get("voter") and pr["voter"].get("img"):
-            v_path = save_tmp(pr["voter"]["img"])
-            _scale_and_draw_image_box(c, v_path, voter_box_x, voter_box_y, col_w, row_h)
-        if pr.get("unified") and pr["unified"].get("img"):
-            u_path = save_tmp(pr["unified"]["img"])
-            _scale_and_draw_image_box(c, u_path, unified_box_x, unified_box_y, col_w, row_h)
+        if pr[0]: paste(pr[0], table_x0, y0, col_w, row_h)
+        if pr[1]: paste(pr[1], table_x0+col_w, y0, col_w, row_h)
 
-# تقسيم الأزواج إلى صفحات (كل صفحة 4 صفوف)
-from math import ceil
-pages = ceil(len(pairs) / rows_per_page) if len(pairs) else 1
-for p in range(pages):
-    chunk = pairs[p*rows_per_page:(p+1)*rows_per_page]
-    # مهم: نضمن أن العمود الأيمن هو "الموحدة" والأيسر "الناخب"
-    # pairs لدينا حالياً بالشكل {"unified":..., "voter":...} بالفعل
-    _draw_grid_page(c, chunk)
-    c.showPage()
+if st.button("🚀 توليد PDF"):
+    if not st.session_state.files:
+        st.warning("ارفع صور أولاً")
+    else:
+        imgs=[Image.open(io.BytesIO(f["bytes"])).convert("RGB") for f in st.session_state.files]
+        cropped=[smart_crop(i) for i in imgs]
+        pairs=list(zip_longest(cropped[0::2],cropped[1::2],fillvalue=None))
 
-c.save()
-# ==== تصدير الـPDF إلى BytesIO ثم إتاحة التنزيل ====
-buf = io.BytesIO()
-c = canvas.Canvas(buf, pagesize=A4)
+        buf=io.BytesIO()
+        c=canvas.Canvas(buf,pagesize=A4)
+        pages=math.ceil(len(pairs)/rows_per_page)
 
-# ... ارسم الصفحات هنا كما هو في كودك (نفس _draw_grid_page والـloop) ...
-for p in range(pages):
-    chunk = pairs[p*rows_per_page:(p+1)*rows_per_page]
-    _draw_grid_page(c, chunk)
-    c.showPage()
+        for p in range(pages):
+            draw_page(c, pairs[p*rows_per_page:(p+1)*rows_per_page])
+            c.showPage()
 
-c.save()
-buf.seek(0)  # مهم!
+        c.save()
+        buf.seek(0)
+        st.session_state.pdf=buf.read()
+        st.success("✅ تم القصّ وإنشاء PDF بنجاح")
 
-file_name = f"matched_cards.pdf"  # أو أضف طابع زمني إن حبيت
-st.download_button(
-    "⬇️ تحميل PDF الناتج",
-    data=buf,
-    file_name=file_name,
-    mime="application/pdf",
-    key="download_cards_pdf"
-)
-st.success("✅ تم إنشاء ملف PDF النهائي بنجاح.")
+if st.session_state.pdf:
+    st.download_button("⬇️ تنزيل PDF", st.session_state.pdf, "matched_cards.pdf")

@@ -932,8 +932,8 @@ with tab_qr:
 
 
 # -*- coding: utf-8 -*-
-# ====================== استخراج بطاقات: ناخب / موحدة / كلاهما (قص تلقائي) ======================
-import io, os, re, zipfile, tempfile
+# ====================== استخراج البطاقات: الناخب / البطاقة الوطنية / كلاهما ======================
+import io, os, re, zipfile
 from datetime import datetime
 from typing import List
 
@@ -942,11 +942,11 @@ from PIL import Image
 import streamlit as st
 import cv2
 
-st.set_page_config(page_title="استخراج البطاقات (ناخب/موحدة)", layout="wide")
-st.title("🪪 استخراج البطاقات - اختر نوع البطاقة")
-st.caption("يقصّ البطاقات من الصور ثم يفلتر حسب نوع البطاقة: بطاقة ناخب، البطاقة الموحدة، أو كليهما.")
+st.set_page_config(page_title="استخراج البطاقات (الناخب/البطاقة الوطنية)", layout="wide")
+st.title("🪪 استخراج البطاقات - الناخب / البطاقة الوطنية")
+st.caption("يقصّ البطاقات من الصور ثم يرشّح حسب النوع المطلوب. يدعم OCR (اختياري) وكلمات مفتاحية عربية مع تطبيع وفَزّي.")
 
-# ------------------------ جلسة التخزين ------------------------
+# ====================== حالة الجلسة ======================
 if "extracted_cards" not in st.session_state:
     st.session_state.extracted_cards = []   # List[PIL.Image]
 if "zip_bytes" not in st.session_state:
@@ -954,7 +954,7 @@ if "zip_bytes" not in st.session_state:
 if "pdf_bytes" not in st.session_state:
     st.session_state.pdf_bytes = b""
 
-# ------------------------ OCR (اختياري) ------------------------
+# ====================== OCR (اختياري) ======================
 def setup_google_vision():
     try:
         from google.cloud import vision
@@ -963,67 +963,105 @@ def setup_google_vision():
         return None
 
 def ocr_text(img_pil: Image.Image, client) -> str:
-    """OCR مع تدوير تلقائي؛ يرجع نص أو فارغ إن فشل/غير مهيأ."""
+    """OCR قوي: مسارات معالجة متعددة + تدوير 0/90/180/270."""
     if client is None:
         return ""
     from google.cloud import vision
-    arr = np.array(img_pil.convert("RGB"))
-    arr = cv2.resize(arr, None, fx=1.5, fy=1.5)
-    g = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    g = cv2.bilateralFilter(g, 11, 75, 75)
-    th = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+
+    src = np.array(img_pil.convert("RGB"))
+    pipes = []
+
+    # 1) الأصلي
+    pipes.append(src)
+
+    # 2) تكبير + رمادي + bilateral + OTSU
+    big = cv2.resize(src, None, fx=1.6, fy=1.6)
+    g = cv2.cvtColor(big, cv2.COLOR_RGB2GRAY)
+    g2 = cv2.bilateralFilter(g, 11, 75, 75)
+    _, otsu = cv2.threshold(g2, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    pipes.append(cv2.cvtColor(otsu, cv2.COLOR_GRAY2RGB))
+
+    # 3) adaptive gaussian
+    th = cv2.adaptiveThreshold(g2, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                cv2.THRESH_BINARY, 31, 10)
+    pipes.append(cv2.cvtColor(th, cv2.COLOR_GRAY2RGB))
+
+    # 4) unsharp + adaptive mean
+    blur = cv2.GaussianBlur(g2, (0,0), 1.0)
+    unsharp = cv2.addWeighted(g2, 1.7, blur, -0.7, 0)
+    th2 = cv2.adaptiveThreshold(unsharp, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                cv2.THRESH_BINARY, 31, 8)
+    pipes.append(cv2.cvtColor(th2, cv2.COLOR_GRAY2RGB))
+
     best = ""
-    for k in [0,1,2,3]:
-        rot = np.rot90(th, k)
-        buf = io.BytesIO()
-        Image.fromarray(rot).save(buf, format="PNG")
-        try:
-            res = client.text_detection(image=vision.Image(content=buf.getvalue()))
+    for img in pipes:
+        for k in (0,1,2,3):
+            rot = np.rot90(img, k)
+            buf = io.BytesIO()
+            Image.fromarray(rot).save(buf, format="PNG")
+            try:
+                res = vision.ImageAnnotatorClient().text_detection(
+                    image=vision.Image(content=buf.getvalue())
+                )
+            except Exception:
+                # بعض البيئات تحتاج إعادة استخدام client المُمرّر
+                try:
+                    res = client.text_detection(image=vision.Image(content=buf.getvalue()))
+                except Exception:
+                    res = None
             if res and res.text_annotations:
                 txt = res.text_annotations[0].description
-                if len(txt) > len(best): best = txt
-        except Exception:
-            pass
+                if len(txt) > len(best):
+                    best = txt
     return best
 
-# ------------------------ نص وفلترة ------------------------
+# ====================== نص وفلترة ======================
 def _normalize_ar(text: str) -> str:
     if not text: return ""
-    s = re.sub(r"[ًٌٍَُِّْـ]", "", text)
-    s = s.replace("أ","ا").replace("إ","ا").replace("آ","ا")
-    s = s.replace("ؤ","و").replace("ئ","ي").replace("ى","ي").replace("ة","ه")
-    return re.sub(r"\s+"," ", s.strip()).lower()
+    t = text
+    t = re.sub(r"[ًٌٍَُِّْـ“”\"'`´ْ]", "", t)  # حذف تشكيل وعلامات
+    t = t.replace("أ","ا").replace("إ","ا").replace("آ","ا")
+    t = t.replace("ؤ","و").replace("ئ","ي").replace("ة","ه").replace("ى","ي")
+    t = re.sub(r"\s+", " ", t.strip())
+    return t.lower()
 
 VOTER_KEYWORDS = [
-    "بطاقه الناخب","بطاقة الناخب","المفوضيه","الانتخابات","رقم الناخب",
-    "المركز","المحطه","البايومتريه","بايومتريه","biometric","voter"
+    "بطاقه الناخب","بطاقة الناخب","المفوضيه","المفوضية","الانتخابات",
+    "رقم الناخب","المركز","المحطه","المحطة","البايومتريه","البايومترية",
+    "biometric","voter"
 ]
 
 UNIFIED_KEYWORDS = [
-    "البطاقه الوطنيه الموحده","البطاقة الموحدة","البطاقه الموحده","البطاقة الوطنية",
-    "الهويه","هوية وطنية","وزارة الداخليه","بطاقة وطنية"
+    # البطاقة الوطنية (تسمية رسمية وشائعة)
+    "البطاقه الوطنيه","البطاقة الوطنية","بطاقة وطنية","هوية وطنية",
+    "الجمهوريه العراقيه","الجمهورية العراقية","وزارة الداخليه","وزارة الداخلية",
+    "الهويه","الهوية","الرقم الوطني","السجل","محافظة","محافظه","تاريخ الاصدار",
+    # مرادفات/صيَغ قديمة
+    "البطاقه الوطنيه الموحده","البطاقة الوطنية الموحدة","الموحده","الموحدة",
 ]
 
-def contains_keyword(text: str, keywords: List[str]) -> bool:
-    t = _normalize_ar(text)
-    for k in keywords:
-        if k in t:
-            return True
-    # أيضاً شاهد الحروف اللاتينية الصغيرة
-    low = (text or "").lower()
-    for k in keywords:
-        if k.lower() in low:
-            return True
+def contains_keyword(text: str, keywords: list, fuzzy=False, threshold=80) -> bool:
+    tnorm = _normalize_ar(text)
+    if not fuzzy:
+        return any(_normalize_ar(k) in tnorm for k in keywords)
+    # fuzzy عبر rapidfuzz إن توفّر
+    try:
+        from rapidfuzz import fuzz as _fz
+        for k in keywords:
+            if _fz.partial_ratio(_normalize_ar(k), tnorm) >= threshold:
+                return True
+    except Exception:
+        return any(_normalize_ar(k) in tnorm for k in keywords)
     return False
 
 def is_voter_card(text: str) -> bool:
-    return contains_keyword(text, VOTER_KEYWORDS)
+    return contains_keyword(text, VOTER_KEYWORDS, fuzzy=True, threshold=78)
 
 def is_unified_card(text: str) -> bool:
-    return contains_keyword(text, UNIFIED_KEYWORDS)
+    # “البطاقة الوطنية”
+    return contains_keyword(text, UNIFIED_KEYWORDS, fuzzy=True, threshold=76)
 
-# ------------------------ كشف/قص البطاقات ------------------------
+# ====================== كشف/قص البطاقات ======================
 def order_pts(pts):
     rect = np.zeros((4,2), dtype="float32")
     s = pts.sum(axis=1); d = np.diff(pts, axis=1)
@@ -1041,8 +1079,7 @@ def four_point_warp(image, pts):
 
 def split_cards_bounding(pil_img: Image.Image) -> List[Image.Image]:
     """
-    ترجع قائمة قصّات لبطاقات محتملة داخل الصورة.
-    تعمل مع صور مثل المستندات الممسوحة.
+    ترجع قائمة قصّات لبطاقات محتملة داخل الصورة (تعمل مع صفحات ممسوحة/خلفية فاتحة).
     """
     img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     H, W = img.shape[:2]
@@ -1068,7 +1105,7 @@ def split_cards_bounding(pil_img: Image.Image) -> List[Image.Image]:
             continue
         if len(approx) == 4:
             warped = four_point_warp(img, approx.reshape(4,2))
-            pad = max(2, int(min(warped.shape[:2]) * 0.02))
+            pad = max(2, int(min(w,h) * 0.02))
             warped = warped[pad:-pad, pad:-pad]
             items.append(Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)))
         else:
@@ -1076,14 +1113,18 @@ def split_cards_bounding(pil_img: Image.Image) -> List[Image.Image]:
             items.append(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)))
         boxes.append((y,x,w,h))
 
-    # ترتيب القصّات من أعلى لأسفل حسب y
     if boxes and len(boxes) == len(items):
-        order = np.argsort([b[0] for b in boxes])
+        order = np.argsort([b[0] for b in boxes])  # من أعلى لأسفل
         items = [items[i] for i in order]
 
     return items if items else [pil_img]
 
-# ------------------------ حفظ ZIP / PDF ------------------------
+# ====================== Helpers بدون OCR ======================
+def _mean_rgb(img_pil: Image.Image):
+    arr = np.array(img_pil.resize((80, 50)))
+    return arr.mean(axis=(0,1))  # (R,G,B)
+
+# ====================== حفظ النتائج ======================
 def build_zip(images: List[Image.Image]) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
@@ -1106,22 +1147,22 @@ def build_pdf(images: List[Image.Image]) -> bytes:
     buf.seek(0)
     return buf.getvalue()
 
-# ------------------------ واجهة المستخدم ------------------------
-st.markdown("### 1) ارفع الصور (يمكن أن تحتوي كل صورة على عدة بطاقات)")
+# ====================== واجهة المستخدم ======================
+st.markdown("### 1) ارفع الصور (قد تحتوي كل صورة على عدة بطاقات)")
 uploaded = st.file_uploader("", type=["jpg","jpeg","png"], accept_multiple_files=True)
 
 st.markdown("### 2) اختر نوع الاستخراج")
-mode = st.selectbox("نوع الاستخراج", ("بطاقة الناخب فقط", "البطاقة الموحدة فقط", "كلاهما"), index=0)
+mode = st.selectbox("نوع الاستخراج", ("بطاقة الناخب فقط", "البطاقة الوطنية فقط", "كلاهما"), index=0)
 
-st.markdown("### 3) خيارات تنفيذ")
+st.markdown("### 3) خيارات")
 col1, col2 = st.columns(2)
 with col1:
     show_crops = st.checkbox("عرض معاينة القصّ (للتأكد)", value=True)
 with col2:
     use_ocr = st.checkbox("استخدام OCR (Google Vision) لتحسين الفلترة", value=True)
 
-st.markdown("### 4) تنفيذ الاستخراج")
-if st.button("🚀 قص واستخراج"):
+st.markdown("### 4) تنفيذ")
+if st.button("🚀 قصّ واستخراج"):
     if not uploaded:
         st.warning("⚠️ رجاءً ارفع صور أولًا.")
     else:
@@ -1132,6 +1173,7 @@ if st.button("🚀 قص واستخراج"):
 
         progress = st.progress(0.0)
         total = len(uploaded)
+
         for i, f in enumerate(uploaded, 1):
             pil = Image.open(io.BytesIO(f.read())).convert("RGB")
             crops = split_cards_bounding(pil)
@@ -1143,53 +1185,49 @@ if st.button("🚀 قص واستخراج"):
                     cols[j % len(cols)].image(cp, use_column_width=True)
 
             for cp in crops:
-                txt = ocr_text(cp, client) if client else ""
-                # حدد إذا نريد بطاقات الناخب أم الموحّدة أم كليهما
                 picked = False
-                if mode == "بطاقة الناخب فقط":
-                    if client:
-                        if is_voter_card(txt): picked = True
+                if client:
+                    txt = ocr_text(cp, client)
+                    if mode == "بطاقة الناخب فقط":
+                        picked = is_voter_card(txt)
+                    elif mode == "البطاقة الوطنية فقط":
+                        picked = is_unified_card(txt)
                     else:
-                        # فلترة بديلة إن لم يتوفر OCR: نسبة عرض/ارتفاع + لون أخضر/أزرق تقريبًا
-                        w,h = cp.size; ratio = w/float(h)
-                        arr = np.array(cp.resize((64,40)))
-                        mean = arr.mean(axis=(0,1))
-                        greenish = (mean[1] > mean[0]*0.9 and mean[1] > mean[2]*0.9)
-                        if 1.2 <= ratio <= 3.0 and greenish: picked = True
-                elif mode == "البطاقة الموحدة فقط":
-                    if client:
-                        if is_unified_card(txt): picked = True
-                    else:
-                        # فلترة بديلة للموحدة: أحيانًا تملك شريط/مظهر أخضر باهت كذلك لكن نصوص مختلفة.
-                        w,h = cp.size; ratio = w/float(h)
-                        arr = np.array(cp.resize((64,40)))
-                        mean = arr.mean(axis=(0,1))
-                        # نسمح لنطاق عريض أضيق قليلًا
-                        if 1.1 <= ratio <= 2.8:
+                        picked = is_voter_card(txt) or is_unified_card(txt)
+                else:
+                    # فلاتر بديلة بدون OCR
+                    w,h = cp.size
+                    ratio = w/float(h)
+                    r,g,b = _mean_rgb(cp)
+
+                    if mode == "بطاقة الناخب فقط":
+                        greenish = (g > r*0.95 and g > b*0.95)
+                        if 1.2 <= ratio <= 3.0 and greenish:
                             picked = True
-                else:  # كلاهما
-                    if client:
-                        if is_voter_card(txt) or is_unified_card(txt): picked = True
+                    elif mode == "البطاقة الوطنية فقط":
+                        light = (r+g+b)/3.0 > 165
+                        not_green_dominant = not (g > r*1.05 and g > b*1.05)
+                        if 1.05 <= ratio <= 2.8 and light and not_green_dominant:
+                            picked = True
                     else:
-                        # بدون OCR، خذ معظم القصّات التي تبدو كبطاقات (نسبة مناسبة)
-                        w,h = cp.size; ratio = w/float(h)
-                        if 1.0 <= ratio <= 3.5: picked = True
+                        if 1.0 <= ratio <= 3.5:
+                            picked = True
 
                 if picked:
                     st.session_state.extracted_cards.append(cp)
 
             progress.progress(i/total)
 
-        st.success(f"✅ انتهى الاستخراج: {len(st.session_state.extracted_cards)} بطاقة/بطاقات مستخرجة.")
+        st.success(f"✅ تم الاستخراج: {len(st.session_state.extracted_cards)} بطاقة/بطاقات.")
 
-        # جهّز التنزيلات
         if st.session_state.extracted_cards:
             st.session_state.zip_bytes = build_zip(st.session_state.extracted_cards)
             st.session_state.pdf_bytes = build_pdf(st.session_state.extracted_cards)
         else:
-            st.session_state.zip_bytes = b""; st.session_state.pdf_bytes = b""
+            st.session_state.zip_bytes = b""
+            st.session_state.pdf_bytes = b""
 
-# ------------------------ تنزيل + معاينة ------------------------
+# ====================== تنزيل + معاينة ======================
 if st.session_state.extracted_cards:
     st.markdown("### 5) تنزيل النتائج")
     c1, c2 = st.columns(2)
@@ -1214,4 +1252,3 @@ if st.session_state.extracted_cards:
     cols = st.columns(4)
     for i, im in enumerate(st.session_state.extracted_cards[:12]):
         cols[i % 4].image(im, use_column_width=True)
-

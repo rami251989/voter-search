@@ -929,126 +929,170 @@ with tab_qr:
             except Exception as e:
                 st.error(f"❌ حدث خطأ أثناء إنشاء PDF: {e}")
 
-# ================= PDF + Download ثابت في Streamlit =================
-import io, tempfile, datetime as _dt
-from math import ceil
-from PIL import Image
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.colors import black
-from reportlab.lib.utils import ImageReader
+# ----------------------------------------------------------------------------- #
+# 🪪 التاب: مطابقة البطاقات وإنتاج PDF عمودين (هوية موحّدة | بطاقة ناخب)
+# ----------------------------------------------------------------------------- #
+with tab_cards_pdf:
+    st.subheader("🖼️ مطابقة البطاقات وتجهيز PDF")
 
-# ---------- إعدادات تصميم الصفحة ----------
-PAGE_W, PAGE_H = A4
-M_LEFT, M_RIGHT, M_TOP, M_BOTTOM = 36, 36, 54, 36
-TITLE = "صورة ضوئية لمستمسكات المراقبين"
-ROWS_PER_PAGE = 4
-NUM_COL_W = 32      # عمود الأرقام (يمين)
-GAP_TITLE = 22
+    st.markdown("""
+    **الخطوات:**
+    1) ارفع صورة/صور فيها بطاقات.  
+    2) قصّ تلقائي ↔ OCR ↔ تصنيف (موحّدة/ناخب) ↔ مطابقة بالأسماء.  
+    3) توليد PDF بنمط: (يسار: بطاقة الناخب) | (يمين: البطاقة الموحّدة) + عمود أرقام يمين.
+    """)
 
-# منطقة الجدول
-TABLE_X0 = M_LEFT
-TABLE_X1 = PAGE_W - M_RIGHT
-TABLE_W  = TABLE_X1 - TABLE_X0
-GRID_TOP = PAGE_H - M_TOP - GAP_TITLE
-GRID_BOT = M_BOTTOM
-GRID_H   = GRID_TOP - GRID_BOT
-ROW_H    = GRID_H / ROWS_PER_PAGE
+    # --------------------- حالة الجلسة: رفع الملفات والنتائج ---------------------
+    if "cards_files" not in st.session_state:
+        st.session_state.cards_files = []   # [{'name':..., 'bytes':...}, ...]
+    if "cards_pdf_bytes" not in st.session_state:
+        st.session_state.cards_pdf_bytes = b""
+        st.session_state.cards_pdf_name  = "matched_cards.pdf"
 
-# عرض عمودي الصور (يسار=ناخب، يمين=موحدة)
-PICS_TOTAL_W = TABLE_W - NUM_COL_W
-COL_W = PICS_TOTAL_W / 2.0
-
-# ---------- دوال رسم مساعدة ----------
-def _ar_center(c, x, y, text, size=12):
-    c.setFont(arabic_font, size)
-    c.drawCentredString(x, y, fix_arabic_text(text))
-
-def _box_image(c, pil_img, x, y, w, h, pad=10):
-    """يرسم الصورة داخل الصندوق مع الحفاظ على النسبة وتوسيطها."""
-    if pil_img is None:
-        return
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-    pil_img.save(tmp.name)
-    iw, ih = pil_img.size
-    max_w, max_h = max(1, w - 2*pad), max(1, h - 2*pad)
-    r = min(max_w/iw, max_h/ih)
-    nw, nh = iw*r, ih*r
-    c.drawImage(ImageReader(tmp.name),
-                x + (w - nw)/2, y + (h - nh)/2,
-                nw, nh, preserveAspectRatio=True, mask='auto')
-
-def _draw_page(c, page_pairs):
-    # العنوان
-    _ar_center(c, PAGE_W/2, PAGE_H - M_TOP + 8, TITLE, size=14)
-
-    # رؤوس الأعمدة
-    _ar_center(c, TABLE_X0 + (COL_W/2),        GRID_TOP + 12,
-               "صورة من الوجه الأول لبطاقة الناخب البايومترية", size=11)
-    _ar_center(c, TABLE_X0 + COL_W + (COL_W/2), GRID_TOP + 12,
-               "صورة من الوجه الأول للبطاقة الموحدة", size=11)
-
-    # الشبّاك
-    c.setStrokeColor(black)
-    c.setLineWidth(1.2)
-    c.rect(TABLE_X0, GRID_BOT, PICS_TOTAL_W, GRID_H)                 # إطار عمودي الصور
-    c.rect(TABLE_X0 + PICS_TOTAL_W, GRID_BOT, NUM_COL_W, GRID_H)     # عمود الأرقام
-    c.line(TABLE_X0 + COL_W, GRID_BOT, TABLE_X0 + COL_W, GRID_TOP)   # الفاصل العمودي
-
-    c.setLineWidth(0.6)
-    for i in range(1, ROWS_PER_PAGE):
-        y = GRID_TOP - i*ROW_H
-        c.line(TABLE_X0, y, TABLE_X0 + PICS_TOTAL_W + NUM_COL_W, y)
-
-    # كل صف
-    for r in range(ROWS_PER_PAGE):
-        y0 = GRID_TOP - (r+1)*ROW_H
-
-        # رقم الصف
-        _ar_center(c, TABLE_X0 + PICS_TOTAL_W + (NUM_COL_W/2),
-                   y0 + ROW_H/2 - 6, str(r+1), size=13)
-
-        rec = page_pairs[r] if r < len(page_pairs) else {"unified": None, "voter": None}
-        voter_img   = rec.get("voter", {}).get("img")
-        unified_img = rec.get("unified", {}).get("img")
-
-        pad = 8
-        w_box, h_box = COL_W - 2*pad, ROW_H - 2*pad
-        voter_x, voter_y     = TABLE_X0 + pad,           y0 + pad          # يسار
-        unified_x, unified_y = TABLE_X0 + COL_W + pad,   y0 + pad          # يمين
-
-        _box_image(c, voter_img,   voter_x,   voter_y,   w_box, h_box)     # بطاقة الناخب
-        _box_image(c, unified_img, unified_x, unified_y, w_box, h_box)     # البطاقة الموحدة
-
-def generate_cards_pdf_bytes(pairs):
-    """يرجع bytes لملف PDF من قائمة pairs."""
-    pages = ceil(len(pairs) / ROWS_PER_PAGE) if pairs else 1
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    for p in range(pages):
-        chunk = pairs[p*ROWS_PER_PAGE:(p+1)*ROWS_PER_PAGE]
-        _draw_page(c, chunk)
-        c.showPage()
-    c.save()
-    buf.seek(0)
-    return buf.getvalue()
-
-# ================== التكامل مع Streamlit ==================
-# داخل حدث المعالجة بعد ما تنتهي من OCR/Matching وتكون pairs جاهزة:
-if imgs_cards and st.button("🚀 معالجة الصور وتوليد PDF"):
-    # ... كودك لاستخراج unified/voter وتكوين pairs موجود هنا ...
-    # في النهاية أنشئ الـPDF واحفظه في السيشن:
-    pdf_bytes = generate_cards_pdf_bytes(pairs)
-    st.session_state["cards_pdf_bytes"] = pdf_bytes
-    st.session_state["cards_pdf_name"]  = f"matched_cards_{_dt.datetime.now():%Y%m%d_%H%M%S}.pdf"
-    st.success("✅ تم إنشاء ملف PDF النهائي.")
-
-# زر التحميل (خارج شرط الزر حتى يظل دائمًا ظاهرًا بعد التوليد)
-if "cards_pdf_bytes" in st.session_state and st.session_state["cards_pdf_bytes"]:
-    st.download_button(
-        "⬇️ تحميل PDF الناتج",
-        data=st.session_state["cards_pdf_bytes"],
-        file_name=st.session_state.get("cards_pdf_name", "matched_cards.pdf"),
-        mime="application/pdf",
-        key="download_cards_pdf"
+    # --------------------- رفع الملفات (دائم الظهور) ---------------------
+    up = st.file_uploader(
+        "📤 ارفع الصور (JPG/PNG) — يمكن أكثر من بطاقة في الصورة الواحدة",
+        type=["jpg","jpeg","png"], accept_multiple_files=True, key="cards_for_pdf"
     )
+    if up:
+        # خزّن نسخة مستقلة في السيشن (حتى بعد rerun)
+        st.session_state.cards_files = [
+            {"name": f.name, "bytes": f.read()} for f in up
+        ]
+        st.success(f"تم حفظ {len(st.session_state.cards_files)} ملف/ملفات للمعالجة.")
+
+    # --------------------- إعدادات المطابقة ---------------------
+    colA, colB = st.columns(2)
+    with colA:
+        min_match = st.slider("🔎 الحد الأدنى لنسبة تطابق الاسم (%)", 50, 100, 70, 1, key="cards_min_match")
+    with colB:
+        add_unmatched = st.checkbox("إدراج غير المطابقين في الـPDF", value=True, key="cards_add_unmatched")
+    show_crops = st.checkbox("👀 عرض معاينة القصّ قبل المطابقة", value=False, key="cards_show_crops")
+
+    st.divider()
+
+    # ===================== دوال الـPDF (تصميم مضبوط) =====================
+    import io, tempfile, datetime as _dt
+    from math import ceil
+    from PIL import Image
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.colors import black
+    from reportlab.lib.utils import ImageReader
+
+    PAGE_W, PAGE_H = A4
+    M_LEFT, M_RIGHT, M_TOP, M_BOTTOM = 36, 36, 54, 36
+    TITLE = "صورة ضوئية لمستمسكات المراقبين"
+    ROWS_PER_PAGE = 4
+    NUM_COL_W = 32
+    GAP_TITLE = 22
+
+    TABLE_X0 = M_LEFT
+    TABLE_X1 = PAGE_W - M_RIGHT
+    TABLE_W  = TABLE_X1 - TABLE_X0
+    GRID_TOP = PAGE_H - M_TOP - GAP_TITLE
+    GRID_BOT = M_BOTTOM
+    GRID_H   = GRID_TOP - GRID_BOT
+    ROW_H    = GRID_H / ROWS_PER_PAGE
+
+    PICS_TOTAL_W = TABLE_W - NUM_COL_W
+    COL_W = PICS_TOTAL_W / 2.0
+
+    def _ar_center(c, x, y, text, size=12):
+        c.setFont(arabic_font, size)
+        c.drawCentredString(x, y, fix_arabic_text(text))
+
+    def _box_image(c, pil_img, x, y, w, h, pad=10):
+        if pil_img is None:
+            return
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+        pil_img.save(tmp.name)
+        iw, ih = pil_img.size
+        max_w, max_h = max(1, w - 2*pad), max(1, h - 2*pad)
+        r = min(max_w/iw, max_h/ih)
+        nw, nh = iw*r, ih*r
+        c.drawImage(ImageReader(tmp.name),
+                    x + (w - nw)/2, y + (h - nh)/2,
+                    nw, nh, preserveAspectRatio=True, mask='auto')
+
+    def _draw_page(c, page_pairs):
+        _ar_center(c, PAGE_W/2, PAGE_H - M_TOP + 8, TITLE, size=14)
+        _ar_center(c, TABLE_X0 + (COL_W/2),          GRID_TOP + 12,
+                   "صورة من الوجه الأول لبطاقة الناخب البايومترية", size=11)
+        _ar_center(c, TABLE_X0 + COL_W + (COL_W/2),  GRID_TOP + 12,
+                   "صورة من الوجه الأول للبطاقة الموحدة", size=11)
+
+        c.setStrokeColor(black)
+        c.setLineWidth(1.2)
+        c.rect(TABLE_X0,               GRID_BOT, PICS_TOTAL_W, GRID_H)          # إطار عمودي الصور
+        c.rect(TABLE_X0 + PICS_TOTAL_W,GRID_BOT, NUM_COL_W,   GRID_H)           # عمود الأرقام
+        c.line(TABLE_X0 + COL_W,       GRID_BOT, TABLE_X0 + COL_W, GRID_TOP)    # فاصلة عمودية
+
+        c.setLineWidth(0.6)
+        for i in range(1, ROWS_PER_PAGE):
+            y = GRID_TOP - i*ROW_H
+            c.line(TABLE_X0, y, TABLE_X0 + PICS_TOTAL_W + NUM_COL_W, y)
+
+        for r in range(ROWS_PER_PAGE):
+            y0 = GRID_TOP - (r+1)*ROW_H
+            _ar_center(c, TABLE_X0 + PICS_TOTAL_W + (NUM_COL_W/2),
+                       y0 + ROW_H/2 - 6, str(r+1), size=13)
+
+            rec = page_pairs[r] if r < len(page_pairs) else {"unified": None, "voter": None}
+            voter_img   = rec.get("voter", {}).get("img")
+            unified_img = rec.get("unified", {}).get("img")
+
+            pad = 8
+            w_box, h_box = COL_W - 2*pad, ROW_H - 2*pad
+            voter_x, voter_y     = TABLE_X0 + pad,         y0 + pad      # يسار = بطاقة الناخب
+            unified_x, unified_y = TABLE_X0 + COL_W + pad, y0 + pad      # يمين = البطاقة الموحدة
+
+            _box_image(c, voter_img,   voter_x,   voter_y,   w_box, h_box)
+            _box_image(c, unified_img, unified_x, unified_y, w_box, h_box)
+
+    def generate_cards_pdf_bytes(pairs):
+        pages = ceil(len(pairs) / ROWS_PER_PAGE) if pairs else 1
+        buf = io.BytesIO()
+        c = canvas.Canvas(buf, pagesize=A4)
+        for p in range(pages):
+            chunk = pairs[p*ROWS_PER_PAGE:(p+1)*ROWS_PER_PAGE]
+            _draw_page(c, chunk)
+            c.showPage()
+        c.save()
+        buf.seek(0)
+        return buf.getvalue()
+
+    # ===================== زر المعالجة (يشتغل على الملفات المخزّنة) =====================
+    if st.button("🚀 معالجة الصور وتوليد PDF"):
+        if not st.session_state.cards_files:
+            st.warning("⚠️ رجاءً ارفع صور أولًا.")
+        else:
+            try:
+                # ---------- هنا ضع منطقك: قص/ OCR / تصنيف / مطابقة ----------
+                # مِثال توضيحي بسيط: نعتبر أن كل صورة تكرّر في عمودَي الصف نفسه
+                # استبدل هذا بـ pairs الحقيقية الناتجة من كودك.
+                demo_imgs = []
+                for item in st.session_state.cards_files:
+                    demo_imgs.append(Image.open(io.BytesIO(item["bytes"])).convert("RGB"))
+
+                pairs = []
+                for im in demo_imgs:
+                    pairs.append({"unified": {"img": im}, "voter": {"img": im}})
+                # -------------------------------------------------------------
+
+                pdf_bytes = generate_cards_pdf_bytes(pairs)
+                st.session_state.cards_pdf_bytes = pdf_bytes
+                st.session_state.cards_pdf_name  = f"matched_cards_{_dt.datetime.now():%Y%m%d_%H%M%S}.pdf"
+                st.success("✅ تم إنشاء ملف PDF النهائي.")
+            except Exception as e:
+                st.error(f"❌ خطأ أثناء المعالجة: {e}")
+
+    # ===================== زر التنزيل (دائم الظهور إن وُجد ملف) =====================
+    if st.session_state.cards_pdf_bytes:
+        st.download_button(
+            "⬇️ تحميل PDF الناتج",
+            data=st.session_state.cards_pdf_bytes,
+            file_name=st.session_state.cards_pdf_name,
+            mime="application/pdf",
+            key="download_cards_pdf"
+        )

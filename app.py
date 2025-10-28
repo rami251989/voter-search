@@ -928,6 +928,7 @@ with tab_qr:
 
             except Exception as e:
                 st.error(f"❌ حدث خطأ أثناء إنشاء PDF: {e}")
+
 # ================= PDF + Download ثابت في Streamlit =================
 import io, tempfile, datetime as _dt
 from math import ceil

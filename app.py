@@ -1087,34 +1087,120 @@ with tab_cards_pdf:
             for i,v in enumerate(voter):
                 if i not in used: pairs.append({"unified":None,"voter":v,"score":0})
 
-        pdf_name="matched_cards.pdf"
-        c=canvas.Canvas(pdf_name,pagesize=A4)
-        page_w,page_h=A4
-        col_gap=18; col_w=(page_w-72-col_gap)/2; row_h=240
-        y=page_h-72
-        c.setFont(arabic_font,12)
-        c.drawRightString(page_w-36, y, fix_arabic_text("صورة بطاقة الناخب"))
-        c.drawRightString(36+col_w, y, fix_arabic_text("صورة البطاقة الموحدة"))
-        y-=30
-        for pr in pairs:
-            if y-row_h<36:
-                c.showPage(); y=page_h-72
-                c.setFont(arabic_font,12)
-                c.drawRightString(page_w-36,y,fix_arabic_text("صورة بطاقة الناخب"))
-                c.drawRightString(36+col_w,y,fix_arabic_text("صورة البطاقة الموحدة"))
-                y-=30
-            def save_tmp(img): tmp=tempfile.NamedTemporaryFile(delete=False,suffix=".jpg"); img.save(tmp.name); return tmp.name
-            u_path=save_tmp(pr["unified"]["img"]) if pr["unified"] else None
-            v_path=save_tmp(pr["voter"]["img"]) if pr["voter"] else None
-            if u_path: _scale_and_draw_image(c,u_path,36,y-row_h,col_w,row_h)
-            if v_path: _scale_and_draw_image(c,v_path,36+col_w+col_gap,y-row_h,col_w,row_h)
-            c.setFont(arabic_font,10)
-            if pr["unified"] and pr["unified"]["name"]:
-                c.drawRightString(36+col_w, y-row_h-12, fix_arabic_text(pr["unified"]["name"]))
-            if pr["voter"] and pr["voter"]["name"]:
-                c.drawRightString(36+col_w+col_gap+col_w, y-row_h-12, fix_arabic_text(pr["voter"]["name"]))
-            y-=row_h+40
-        c.save()
-        with open(pdf_name,"rb") as f:
-            st.download_button("⬇️ تحميل PDF الناتج", f, file_name=pdf_name, mime="application/pdf")
-        st.success("✅ تم إنشاء ملف PDF النهائي بنجاح.")
+       # ------------ توليد PDF بشكل مطابق للعينة ------------
+pdf_name = "matched_cards.pdf"
+c = canvas.Canvas(pdf_name, pagesize=A4)
+page_w, page_h = A4
+
+# إعدادات الهوامش والشبكة
+M_LEFT   = 36
+M_RIGHT  = 36
+M_TOP    = 48
+M_BOTTOM = 36
+
+TITLE = "صورة ضوئية لمستمسكات المراقبين"
+NUM_COL_W = 28  # عرض عمود الأرقام يميناً
+GAP_TITLE = 28
+
+# منطقة الجدول (تحت العنوان)
+table_x0 = M_LEFT
+table_x1 = page_w - M_RIGHT
+table_w  = table_x1 - table_x0
+grid_top = page_h - M_TOP - GAP_TITLE
+grid_bot = M_BOTTOM
+grid_h   = grid_top - grid_bot
+
+rows_per_page = 4
+row_h = grid_h / rows_per_page
+
+# عرض عمودين للصور + عمود أرقام يميناً
+pics_total_w = table_w - NUM_COL_W
+col_w = pics_total_w / 2.0
+
+def _draw_centered_ar(c, x, y, text, font=arabic_font, size=12):
+    c.setFont(font, size)
+    c.drawCentredString(x, y, fix_arabic_text(text))
+
+def _scale_and_draw_image_box(c, path, x, y, w, h, pad=10):
+    # يرسم الصورة داخل الصندوق (x,y) أسفل-يسار، مع حواف داخلية بسيطة
+    from reportlab.lib.utils import ImageReader
+    img = Image.open(path); iw, ih = img.size
+    max_w = max(1, w - 2*pad)
+    max_h = max(1, h - 2*pad)
+    r = min(max_w/iw, max_h/ih)
+    nw, nh = iw*r, ih*r
+    c.drawImage(ImageReader(path),
+                x + (w - nw)/2, y + (h - nh)/2,
+                nw, nh,
+                preserveAspectRatio=True, mask='auto')
+
+def _draw_grid_page(c, page_pairs):
+    # عنوان الصفحة
+    c.setFont(arabic_font, 14)
+    _draw_centered_ar(c, page_w/2, page_h - M_TOP, TITLE)
+
+    # رسم الإطار الخارجي للجدول
+    c.setLineWidth(1)
+    # المستطيل الرئيسي: عمودين صور + عمود أرقام
+    c.rect(table_x0, grid_bot, pics_total_w, grid_h)          # إطار عمودي للصور
+    c.rect(table_x0 + pics_total_w, grid_bot, NUM_COL_W, grid_h)  # عمود الأرقام يميناً
+
+    # خطوط عمودية فاصلة بين العمودين (يمين = الموحدة / يسار = الناخب)
+    # ترتيب الأعمدة من اليسار لليمين: [الناخب][الموحدة][الأرقام]
+    c.line(table_x0 + col_w, grid_bot, table_x0 + col_w, grid_top)  # فاصلة وسط عمودي الصور
+
+    # خطوط أفقية للصفوف
+    for i in range(1, rows_per_page):
+        y = grid_top - i*row_h
+        c.line(table_x0, y, table_x0 + pics_total_w + NUM_COL_W, y)
+
+    # التسميات أعلى العمودين (اختياري لكنها مطابقة لروح العينة)
+    c.setFont(arabic_font, 12)
+    _draw_centered_ar(c, table_x0 + (col_w/2), grid_top + 10, "صورة من الوجه الأول لبطاقة الناخب البايومترية")
+    _draw_centered_ar(c, table_x0 + col_w + (col_w/2), grid_top + 10, "صورة من الوجه الأول للبطاقة الموحدة")
+
+    # تعبئة الصفوف بالصور + أرقام ١..٤
+    for r in range(rows_per_page):
+        # حدود خلية هذا الصف
+        y0 = grid_top - (r+1)*row_h
+        # مربعات الصور:
+        # يسار: الناخب  | يمين: الموحّدة
+        voter_box_x = table_x0
+        voter_box_y = y0
+        unified_box_x = table_x0 + col_w
+        unified_box_y = y0
+
+        # رقم الصف في عمود الأرقام (يمين)
+        c.setFont(arabic_font, 14)
+        num_center_x = table_x0 + pics_total_w + (NUM_COL_W/2)
+        num_center_y = y0 + row_h/2 - 6
+        _draw_centered_ar(c, num_center_x, num_center_y, str(r+1))
+
+        # ضع الصور إن وجدت
+        pr = page_pairs[r] if r < len(page_pairs) else {"unified": None, "voter": None}
+        def save_tmp(img):
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+            img.save(tmp.name); return tmp.name
+
+        if pr.get("voter") and pr["voter"].get("img"):
+            v_path = save_tmp(pr["voter"]["img"])
+            _scale_and_draw_image_box(c, v_path, voter_box_x, voter_box_y, col_w, row_h)
+        if pr.get("unified") and pr["unified"].get("img"):
+            u_path = save_tmp(pr["unified"]["img"])
+            _scale_and_draw_image_box(c, u_path, unified_box_x, unified_box_y, col_w, row_h)
+
+# تقسيم الأزواج إلى صفحات (كل صفحة 4 صفوف)
+from math import ceil
+pages = ceil(len(pairs) / rows_per_page) if len(pairs) else 1
+for p in range(pages):
+    chunk = pairs[p*rows_per_page:(p+1)*rows_per_page]
+    # مهم: نضمن أن العمود الأيمن هو "الموحدة" والأيسر "الناخب"
+    # pairs لدينا حالياً بالشكل {"unified":..., "voter":...} بالفعل
+    _draw_grid_page(c, chunk)
+    c.showPage()
+
+c.save()
+
+with open(pdf_name, "rb") as f:
+    st.download_button("⬇️ تحميل PDF الناتج", f, file_name=pdf_name, mime="application/pdf")
+st.success("✅ تم إنشاء ملف PDF النهائي بنجاح بالشكل المطلوب.")

@@ -1200,7 +1200,25 @@ for p in range(pages):
     c.showPage()
 
 c.save()
+# ==== تصدير الـPDF إلى BytesIO ثم إتاحة التنزيل ====
+buf = io.BytesIO()
+c = canvas.Canvas(buf, pagesize=A4)
 
-with open(pdf_name, "rb") as f:
-    st.download_button("⬇️ تحميل PDF الناتج", f, file_name=pdf_name, mime="application/pdf")
-st.success("✅ تم إنشاء ملف PDF النهائي بنجاح بالشكل المطلوب.")
+# ... ارسم الصفحات هنا كما هو في كودك (نفس _draw_grid_page والـloop) ...
+for p in range(pages):
+    chunk = pairs[p*rows_per_page:(p+1)*rows_per_page]
+    _draw_grid_page(c, chunk)
+    c.showPage()
+
+c.save()
+buf.seek(0)  # مهم!
+
+file_name = f"matched_cards.pdf"  # أو أضف طابع زمني إن حبيت
+st.download_button(
+    "⬇️ تحميل PDF الناتج",
+    data=buf,
+    file_name=file_name,
+    mime="application/pdf",
+    key="download_cards_pdf"
+)
+st.success("✅ تم إنشاء ملف PDF النهائي بنجاح.")

@@ -931,206 +931,119 @@ with tab_qr:
 
 
 
+
+
 # -*- coding: utf-8 -*-
-# ================== Safe Mode: PDF عمودين بستخدام Pillow فقط ==================
-import io
-import os
+import io, tempfile, math
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
-from datetime import datetime
+from PIL import Image
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from itertools import zip_longest
 
-st.set_page_config(page_title="مطابقة البطاقات → PDF (Safe Mode)", layout="wide")
+st.set_page_config(page_title="مطابقة البطاقات PDF", layout="wide")
 
-st.title("بغداد - البحث في سجلات الناخبين")
-st.subheader("🖼️ مطابقة البطاقات وتجهيز PDF (وضع آمن بدون OCR/قصّ تلقائي)")
+st.title("مطابقة البطاقات → PDF")
+st.write("✅ قص تلقائي + تنظيم بنمط الوزارة")
 
-st.markdown("""
-هذا الوضع الآمن يشتغل بأقل اعتمادات ممكنة.  
-**الفكرة:** ارفع صور البطاقات (مقصوصة أو لا)، وسيتم وضعها **جنب بعض** في PDF:
-- العمود **الأيسر**: بطاقة الناخب  
-- العمود **الأيمن**: البطاقة الموحدة  
-- عمود أرقام على يمين الصفحة  
-- 4 صفوف في كل صفحة  
-""")
-
-# ------------------------- حالة الجلسة -------------------------
+# حالة الجلسة
 if "cards_files" not in st.session_state:
-    st.session_state.cards_files = []        # [{'name':..., 'bytes':...}]
-if "cards_pdf_bytes" not in st.session_state:
-    st.session_state.cards_pdf_bytes = b""
-    st.session_state.cards_pdf_name  = "matched_cards.pdf"
+    st.session_state.cards_files = []
+if "pdf_bytes" not in st.session_state:
+    st.session_state.pdf_bytes = b""
 
-# ------------------------- رفع الملفات -------------------------
-up = st.file_uploader("📤 ارفع الصور (JPG/PNG)", type=["jpg","jpeg","png"], accept_multiple_files=True)
-if up:
-    st.session_state.cards_files = [{"name": f.name, "bytes": f.read()} for f in up]
-    st.success(f"تم حفظ {len(st.session_state.cards_files)} ملف/ملفات.")
+# رفع الصور
+files = st.file_uploader("📥 ارفع صور البطاقات", type=["jpg","jpeg","png"], accept_multiple_files=True)
 
-st.divider()
+if files:
+    st.session_state.cards_files = [{"name": f.name, "bytes": f.read()} for f in files]
+    st.success(f"✅ تم تحميل {len(files)} صور")
 
-# ------------------------- إعدادات بسيطة -------------------------
+# دالة قص تلقائي للصورة
+def auto_crop(img):
+    img_gray = img.convert("L")
+    bw = img_gray.point(lambda x: 0 if x < 240 else 255, '1')
+    bbox = bw.getbbox()
+    return img.crop(bbox) if bbox else img
+
 rows_per_page = 4
-left_label  = "صورة من الوجه الأول لبطاقة الناخب البايومترية"
-right_label = "صورة من الوجه الأول للبطاقة الموحدة"
-title_text  = "صورة ضوئية لمستمسكات المراقبين"
+arabic_font = 'Helvetica'  # يمكن تبدليها لاحقًا
 
-# ------------------------- دوال مساعدة (Pillow) -------------------------
-def _load_font(size=24):
-    # نحاول خطوط عربية شائعة، وإن لم تتوفر نستعمل الخط الافتراضي
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
-        "/usr/share/fonts/truetype/amiri/Amiri-Regular.ttf",
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            return ImageFont.truetype(p, size=size)
-    return ImageFont.load_default()
+TITLE = "صورة ضوئية لمستمسكات المراقبين"
+NUM_COL_W = 28
+GAP_TITLE = 28
+M_LEFT, M_RIGHT, M_TOP, M_BOTTOM = 36,36,48,36
 
-FONT_TITLE   = _load_font(40)
-FONT_HEADER  = _load_font(26)
-FONT_NUMBER  = _load_font(30)
+page_w, page_h = A4
+table_x0 = M_LEFT
+table_x1 = page_w - M_RIGHT
+table_w  = table_x1 - table_x0
+grid_top = page_h - M_TOP - GAP_TITLE
+grid_bot = M_BOTTOM
+grid_h   = grid_top - grid_bot
+row_h = grid_h / rows_per_page
+pics_total_w = table_w - NUM_COL_W
+col_w = pics_total_w / 2.0
 
-def draw_centered_text(draw, xy_center, text, font):
-    # بدون bidi/reshaper (وضع آمن)، نرسم كما هو. إن أردت دعم bidi أضفه لاحقًا.
-    w, h = draw.textbbox((0,0), text, font=font)[2:]
-    draw.text((xy_center[0]-w/2, xy_center[1]-h/2), text, fill=(0,0,0), font=font)
+def draw_center(c, x, y, text, size):
+    c.setFont(arabic_font, size)
+    c.drawCentredString(x, y, text)
 
-def place_image_in_box(page, img, box, pad=20):
-    """ضع الصورة داخل المستطيل مع الحفاظ على النسبة."""
-    if img is None:
-        return
-    x, y, w, h = box
+def place_img(c, img, x, y, w, h, pad=10):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    img.save(tmp.name)
     iw, ih = img.size
-    max_w, max_h = max(1, w - 2*pad), max(1, h - 2*pad)
-    r = min(max_w/iw, max_h/ih)
-    nw, nh = int(iw*r), int(ih*r)
-    img2 = img.resize((nw, nh), Image.LANCZOS)
-    page.paste(img2, (x + (w - nw)//2, y + (h - nh)//2))
+    r = min((w-pad*2)/iw, (h-pad*2)/ih)
+    nw, nh = iw*r, ih*r
+    c.drawImage(tmp.name, x+(w-nw)/2, y+(h-nh)/2, nw, nh, preserveAspectRatio=True, mask='auto')
 
-def build_pdf_pages(pairs):
-    """
-    pairs: قائمة من عناصر {'unified': PIL.Image أو None, 'voter': PIL.Image أو None}
-    تُرجع bytes لملف PDF بصفحات A4 منسّقة.
-    """
-    # A4 عند 300 DPI ~ 2480x3508
-    W, H = 2480, 3508
-    M_LEFT, M_RIGHT, M_TOP, M_BOTTOM = 100, 100, 160, 120
-    NUM_COL_W = 120
-    GAP_TITLE = 40
+def draw_page(c, items):
+    draw_center(c, page_w/2, page_h-M_TOP, TITLE, 14)
+    c.rect(table_x0, grid_bot, pics_total_w, grid_h)
+    c.rect(table_x0+pics_total_w, grid_bot, NUM_COL_W, grid_h)
+    c.line(table_x0+col_w, grid_bot, table_x0+col_w, grid_top)
+    for i in range(1, rows_per_page):
+        y = grid_top - i * row_h
+        c.line(table_x0, y, table_x0+pics_total_w+NUM_COL_W, y)
 
-    TABLE_X0 = M_LEFT
-    TABLE_X1 = W - M_RIGHT
-    TABLE_W  = TABLE_X1 - TABLE_X0
-    GRID_TOP = H - M_TOP - GAP_TITLE
-    GRID_BOT = M_BOTTOM
-    GRID_H   = GRID_TOP - GRID_BOT
-    ROW_H    = GRID_H // rows_per_page
+    draw_center(c, table_x0+col_w/2, grid_top+10, "بطاقة الناخب", 12)
+    draw_center(c, table_x0+col_w+col_w/2, grid_top+10, "البطاقة الموحدة", 12)
 
-    PICS_TOTAL_W = TABLE_W - NUM_COL_W
-    COL_W = PICS_TOTAL_W // 2
+    for r in range(rows_per_page):
+        y0 = grid_top - (r+1)*row_h
+        draw_center(c, table_x0+pics_total_w+NUM_COL_W/2, y0+row_h/2-6, str(r+1), 14)
+        pair = items[r] if r < len(items) else (None,None)
+        if pair[0]: place_img(c, pair[0], table_x0,         y0, col_w, row_h)
+        if pair[1]: place_img(c, pair[1], table_x0+col_w,   y0, col_w, row_h)
 
-    pages = []
-    # قسّم الأزواج لقطع من 4
-    for p in range(0, len(pairs) or 1, rows_per_page):
-        chunk = pairs[p:p+rows_per_page]
-        page = Image.new("RGB", (W, H), "white")
-        d = ImageDraw.Draw(page)
-
-        # العنوان
-        draw_centered_text(d, (W//2, M_TOP//2), title_text, FONT_TITLE)
-
-        # رؤوس الأعمدة
-        draw_centered_text(d, (TABLE_X0 + COL_W//2, GRID_TOP + 18), left_label, FONT_HEADER)
-        draw_centered_text(d, (TABLE_X0 + COL_W + COL_W//2, GRID_TOP + 18), right_label, FONT_HEADER)
-
-        # الشبّاك
-        # إطار عمودي الصور
-        d.rectangle([TABLE_X0, GRID_BOT, TABLE_X0 + PICS_TOTAL_W, GRID_TOP], outline=(0,0,0), width=3)
-        # عمود الأرقام
-        d.rectangle([TABLE_X0 + PICS_TOTAL_W, GRID_BOT, TABLE_X0 + PICS_TOTAL_W + NUM_COL_W, GRID_TOP], outline=(0,0,0), width=3)
-        # الفاصل العمودي بين العمودين
-        d.line([TABLE_X0 + COL_W, GRID_BOT, TABLE_X0 + COL_W, GRID_TOP], fill=(0,0,0), width=2)
-        # خطوط الصفوف
-        for i in range(1, rows_per_page):
-            y = GRID_TOP - i*ROW_H
-            d.line([TABLE_X0, y, TABLE_X0 + PICS_TOTAL_W + NUM_COL_W, y], fill=(0,0,0), width=2)
-
-        # تعبئة الصفوف
-        for r in range(rows_per_page):
-            y0 = GRID_TOP - (r+1)*ROW_H
-            # رقم الصف
-            draw_centered_text(
-                d,
-                (TABLE_X0 + PICS_TOTAL_W + NUM_COL_W//2, y0 + ROW_H//2),
-                str(r+1),
-                FONT_NUMBER
-            )
-            rec = chunk[r] if r < len(chunk) else {"unified": None, "voter": None}
-
-            # صناديق الصور: يسار = ناخب، يمين = موحدة
-            voter_box   = (TABLE_X0,             y0,             COL_W, ROW_H)
-            unified_box = (TABLE_X0 + COL_W,     y0,             COL_W, ROW_H)
-
-            # ضع الصور (إن وجدت)
-            if rec.get("voter"):   place_image_in_box(page, rec["voter"],   voter_box, pad=20)
-            if rec.get("unified"): place_image_in_box(page, rec["unified"], unified_box, pad=20)
-
-        pages.append(page)
-
-    # حفظ كمستند PDF متعدد الصفحات باستخدام Pillow فقط
-    buf = io.BytesIO()
-    if len(pages) == 1:
-        pages[0].save(buf, format="PDF", resolution=300.0)
-    else:
-        pages[0].save(buf, format="PDF", save_all=True, append_images=pages[1:], resolution=300.0)
-    buf.seek(0)
-    return buf.getvalue()
-
-# ------------------------- زر المعالجة (Safe Mode) -------------------------
-st.caption("هذا الوضع لا يقصّ تلقائيًا ولا يستخدم OCR — فقط ينسّق الصور في PDF لضمان أن كل شيء ظاهر ويعمل. بعدها نرجّع نفعّل القص/OCR.")
-
-if st.button("🚀 توليد PDF (وضع آمن)"):
+# زر إنشاء PDF
+if st.button("🚀 توليد PDF"):
     if not st.session_state.cards_files:
-        st.warning("⚠️ رجاء ارفع صور أولًا.")
+        st.error("🚫 ارفع صور أولاً")
     else:
-        try:
-            # نبني أزواج بسيطة: كل صورتين تشكّل صف (يسار/يمين)
-            # إن أردت: اسحب الترتيب بنفسك. هنا نقول: حتى الفهرس = ناخب (يسار)، الفردي = موحدة (يمين)
-            imgs = [Image.open(io.BytesIO(x["bytes"])).convert("RGB") for x in st.session_state.cards_files]
+        imgs = [Image.open(io.BytesIO(f["bytes"])) for f in st.session_state.cards_files]
+        cropped = [auto_crop(i) for i in imgs]
+        pairs = list(zip_longest(cropped[0::2], cropped[1::2], fillvalue=None))
 
-            # كوّن pairs: كل صف فيه {'voter': img_left, 'unified': img_right}
-            pairs = []
-            i = 0
-            while i < len(imgs):
-                voter_img   = imgs[i] if i < len(imgs) else None
-                unified_img = imgs[i+1] if i+1 < len(imgs) else None
-                pairs.append({"voter": voter_img, "unified": unified_img})
-                i += 2
+        buf = io.BytesIO()
+        c = canvas.Canvas(buf, pagesize=A4)
 
-            pdf_bytes = build_pdf_pages(pairs)
-            st.session_state.cards_pdf_bytes = pdf_bytes
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            st.session_state.cards_pdf_name = f"matched_cards_{ts}.pdf"
-            st.success("✅ تم إنشاء ملف PDF.")
-        except Exception as e:
-            st.exception(e)
+        pages = math.ceil(len(pairs)/rows_per_page)
+        for p in range(pages):
+            chunk = pairs[p*rows_per_page:(p+1)*rows_per_page]
+            draw_page(c, chunk)
+            c.showPage()
 
-# ------------------------- زر التحميل ثابت -------------------------
-if st.session_state.cards_pdf_bytes:
+        c.save()
+        buf.seek(0)
+        st.session_state.pdf_bytes = buf.read()
+        st.success("✅ PDF جاهز")
+
+# زر تحميل
+if st.session_state.pdf_bytes:
     st.download_button(
-        "⬇️ تحميل PDF الناتج",
-        data=st.session_state.cards_pdf_bytes,
-        file_name=st.session_state.cards_pdf_name,
-        mime="application/pdf",
-        use_container_width=True,
-        key="download_safe_pdf"
+        "⬇️ تحميل ملف PDF",
+        data=st.session_state.pdf_bytes,
+        file_name="matched_cards.pdf",
+        mime="application/pdf"
     )
-
-# ------------------------- عرض معاينة (اختياري) -------------------------
-with st.expander("👀 معاينة أول صور مرفوعة"):
-    if st.session_state.cards_files:
-        cols = st.columns(4)
-        for i, item in enumerate(st.session_state.cards_files[:8]):
-            img = Image.open(io.BytesIO(item["bytes"]))
-            cols[i % 4].image(img, caption=item["name"], use_column_width=True)

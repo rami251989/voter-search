@@ -11,4 +11,3 @@ rapidfuzz
 qrcode
 reportlab
 arabic-reshaper
-python-bidi

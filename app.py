@@ -144,7 +144,7 @@ st.title("📊 بغداد - البحث في سجلات الناخبين")
 st.markdown("سيتم البحث في قواعد البيانات باستخدام الذكاء الاصطناعي 🤖")
 
 # ====== تبويبات ======
-tab_browse, tab_single, tab_file, tab_file_name_center, tab_count, tab_check, tab_count_custom, tab_qr, tab_cards_pdf = st.tabs(
+tab_browse, tab_single, tab_file, tab_file_name_center, tab_count, tab_check, tab_count_custom, tab_qr, tab_cards_pdf, tab_names = st.tabs(
     [
         "📄 تصفّح السجلات",
         "🔍 بحث برقم",
@@ -154,7 +154,8 @@ tab_browse, tab_single, tab_file, tab_file_name_center, tab_count, tab_check, ta
         "🧾 التحقق من المعلومات",
         "🧮 تحليل البيانات (COUNT)",
         "🧾 توليد QR PDF",
-        "🖼️ مطابقة البطاقات → PDF"
+        "🖼️ مطابقة البطاقات → PDF",
+        "🗂️ رفع أسماء (كل النتائج)"   # 👈 الجديد
     ]
 )
 
@@ -987,3 +988,168 @@ with tab_qr:
             except Exception as e:
                 st.error(f"❌ حدث خطأ أثناء إنشاء PDF: {e}")
 
+# ----------------------------------------------------------------------------- #
+# 🔟 🗂️ رفع أسماء (إرجاع كل النتائج، مع الحفاظ على التكرار والترتيب)
+# ----------------------------------------------------------------------------- #
+with tab_names:
+    st.subheader("🗂️ رفع أسماء (إرجاع كل النتائج)")
+
+    st.markdown("""
+    **📋 التعليمات:**
+    - ارفع ملف Excel يحتوي عمودًا للاسم. الأعمدة المقبولة: **الاسم** أو **الاسم الثلاثي** أو **Name**.
+    - سيتم جلب **جميع السجلات** المطابقة لكل اسم من قاعدة بغداد.
+    - يتم **الحفاظ على ترتيب وتكرار الأسماء** كما وردت في الملف.
+    """)
+
+    uploaded_names = st.file_uploader("📤 ارفع ملف الأسماء (Excel)", type=["xlsx"], key="names_file")
+
+    if uploaded_names and st.button("🚀 جلب النتائج لكل الأسماء"):
+        try:
+            # 1) قراءة الملف وتحديد عمود الاسم
+            src_df = pd.read_excel(uploaded_names, engine="openpyxl")
+            src_df.columns = src_df.columns.astype(str).str.strip()
+
+            name_col = None
+            for candidate in ["الاسم", "الاسم الثلاثي", "Name", "name"]:
+                if candidate in src_df.columns:
+                    name_col = candidate
+                    break
+
+            if not name_col:
+                st.error("❌ يجب أن يحتوي الملف على عمود اسم باسم: (الاسم) أو (الاسم الثلاثي) أو (Name)")
+                st.stop()
+
+            # قائمـة الأسماء مع الحفاظ على الترتيب والتكرار
+            input_names = (
+                src_df[name_col]
+                .astype(str)
+                .fillna("")
+                .str.strip()
+                .tolist()
+            )
+
+            # منع الملف الفارغ
+            if len(input_names) == 0:
+                st.warning("⚠️ الملف لا يحتوي على أسماء.")
+                st.stop()
+
+            # 2) جلب كل السجلات المطابقة لكل اسم (استعلام واحد بالأسماء الفريدة)
+            unique_names = sorted(set([n for n in input_names if n]))
+            results_db = pd.DataFrame()
+
+            if unique_names:
+                conn = get_conn()
+                try:
+                    query = """
+                        SELECT
+                            "رقم الناخب","الاسم الثلاثي","الجنس","هاتف","رقم العائلة",
+                            "اسم مركز الاقتراع","رقم مركز الاقتراع",
+                            "المدينة","رقم مركز التسجيل","اسم مركز التسجيل","تاريخ الميلاد"
+                        FROM "Bagdad"
+                        WHERE CAST("الاسم الثلاثي" AS TEXT) = ANY(%(names)s)
+                    """
+                    results_db = pd.read_sql_query(query, conn, params={"names": unique_names})
+                finally:
+                    conn.close()
+
+            # 3) توحيد الأعمدة وإظهار الجنس كـ M/F
+            if not results_db.empty:
+                results_db = results_db.rename(columns={
+                    "رقم الناخب": "رقم الناخب",
+                    "الاسم الثلاثي": "الاسم",
+                    "الجنس": "الجنس",
+                    "هاتف": "رقم الهاتف",
+                    "رقم العائلة": "رقم العائلة",
+                    "اسم مركز الاقتراع": "مركز الاقتراع",
+                    "رقم مركز الاقتراع": "رقم مركز الاقتراع",
+                    "المدينة": "المدينة",
+                    "رقم مركز التسجيل": "رقم مركز التسجيل",
+                    "اسم مركز التسجيل": "اسم مركز التسجيل",
+                    "تاريخ الميلاد": "تاريخ الميلاد"
+                })
+                results_db["الجنس"] = results_db["الجنس"].apply(map_gender)
+
+            # 4) إعادة بناء النتائج بحسب ترتيب/تكرار الإدخال
+            #    لكل اسم في الإدخال: إذا له عدة صفوف في DB نضيفها كلها، وإذا لا يوجد نضيف صف "غير موجود"
+            ordered_rows = []
+            if not results_db.empty:
+                # فهرس سريع حسب الاسم
+                grouped = results_db.groupby("الاسم", sort=False)
+                has_name = set(results_db["الاسم"].astype(str))
+
+                for nm in input_names:
+                    nm_str = str(nm)
+                    if nm_str in has_name:
+                        # كل الصفوف المطابقة لهذا الاسم
+                        part = grouped.get_group(nm_str)
+                        # نضيف نسخة مطابقة لكل تكرار في الإدخال
+                        ordered_rows.append(part.copy())
+                    else:
+                        # صف يدل على أنه غير موجود
+                        ordered_rows.append(pd.DataFrame([{
+                            "رقم الناخب": "—",
+                            "الاسم": nm_str,
+                            "الجنس": "—",
+                            "رقم الهاتف": "—",
+                            "رقم العائلة": "—",
+                            "مركز الاقتراع": "—",
+                            "رقم مركز الاقتراع": "—",
+                            "المدينة": "—",
+                            "رقم مركز التسجيل": "—",
+                            "اسم مركز التسجيل": "—",
+                            "تاريخ الميلاد": "—",
+                            "ملاحظة": "❌ غير موجود في القاعدة"
+                        }]))
+            else:
+                # لا توجد نتائج لأي اسم
+                for nm in input_names:
+                    ordered_rows.append(pd.DataFrame([{
+                        "رقم الناخب": "—",
+                        "الاسم": str(nm),
+                        "الجنس": "—",
+                        "رقم الهاتف": "—",
+                        "رقم العائلة": "—",
+                        "مركز الاقتراع": "—",
+                        "رقم مركز الاقتراع": "—",
+                        "المدينة": "—",
+                        "رقم مركز التسجيل": "—",
+                        "اسم مركز التسجيل": "—",
+                        "تاريخ الميلاد": "—",
+                        "ملاحظة": "❌ غير موجود في القاعدة"
+                    }]))
+
+            final_df = pd.concat(ordered_rows, ignore_index=True) if ordered_rows else pd.DataFrame()
+
+            # ترتيب الأعمدة بشكل موحد
+            columns_order = [
+                "الاسم","رقم الناخب","الجنس","رقم الهاتف","رقم العائلة",
+                "مركز الاقتراع","رقم مركز الاقتراع",
+                "المدينة","رقم مركز التسجيل","اسم مركز التسجيل","تاريخ الميلاد","ملاحظة"
+            ]
+            for col in columns_order:
+                if col not in final_df.columns:
+                    final_df[col] = ""
+            final_df = final_df[columns_order]
+
+            # 5) عرض النتائج + زر تحميل
+            st.dataframe(final_df, use_container_width=True, height=480)
+
+            out_xlsx = "نتائج_الأسماء.xlsx"
+            final_df.to_excel(out_xlsx, index=False, engine="openpyxl")
+            # جعل العرض من اليمين لليسار داخل الملف
+            try:
+                wb = load_workbook(out_xlsx)
+                wb.active.sheet_view.rightToLeft = True
+                wb.save(out_xlsx)
+            except:
+                pass
+
+            with open(out_xlsx, "rb") as f:
+                st.download_button("⬇️ تحميل النتائج (Excel)", f,
+                    file_name="نتائج_الأسماء.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+            st.success("✅ تم إرجاع كل النتائج بحسب الأسماء المدخلة.")
+
+        except Exception as e:
+            st.error(f"❌ حدث خطأ أثناء معالجة الملف: {e}")

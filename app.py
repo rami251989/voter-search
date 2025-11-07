@@ -943,41 +943,67 @@ with tab_qr:
                 pdf_name = "qr_codes.pdf"
                 c = canvas.Canvas(pdf_name, pagesize=A4)
 
-                rows, cols = 6, 4               # ✅ 24 كود في الصفحة
-                qr_size = 95                    # ✅ حجم QR ممتاز
+                rows, cols = 6, 4        # لا مشكلة نبقيها 6×4 إذا صغّرنا الـQR تلقائيًا
                 page_w, page_h = A4
-                x_margin, y_margin = 50, 70     # ✅ مسافات خارجية
-                spacing_x = 25                  # ✅ تباعد بين الأكواد أفقياً
-                spacing_y = 30                  # ✅ تباعد بين الأكواد عمودياً
+
+                # هوامش
+                x_margin, y_margin = 50, 70
+
+                # مساحة النص أسفل كل QR (سطران بخط 11 pt + هامش بسيط)
+                font_size = 11
+                text_block_h = 2*font_size + 12   # ≈ 34pt
+
+                # المساحة المتاحة
+                avail_w = page_w - 2*x_margin
+                avail_h = page_h - 2*y_margin
+
+                # حجم الخلية (يقسم الصفحة شبكة rows×cols)
+                cell_w = avail_w / cols
+                cell_h = avail_h / rows
+
+                # احسب حجم الـQR المناسب تلقائيًا بحيث لا يتجاوز الخلية بعد خصم النص
+                # اترك 6pt padding حول الـQR داخل الخلية
+                inner_pad = 6
+                qr_size = min(cell_w - 2*inner_pad, cell_h - text_block_h - 2*inner_pad)
+                qr_size = max(40, qr_size)  # حد أدنى معقول
 
                 count = 0
                 for _, row in df_qr.iterrows():
                     name = fix_arabic_text(str(row["الاسم"]))
-                    rep = fix_arabic_text(str(row['مندوب رئيسي']))
+                    rep  = fix_arabic_text(str(row["مندوب رئيسي"]))
                     link = str(row["رمز QR"])
 
-                    if count % 24 == 0 and count != 0:
+                    if count % (rows*cols) == 0 and count != 0:
                         c.showPage()
 
                     qr_img = qrcode.make(link)
                     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
                     qr_img.save(tmp.name)
 
-                    row_i = (count % 24) // cols
-                    col_i = (count % 24) % cols
+                    # فهارس الخلية
+                    r = (count % (rows*cols)) // cols
+                    cidx = (count % (rows*cols)) % cols
 
-                    x = x_margin + col_i * (qr_size + spacing_x)
-                    y = page_h - y_margin - (row_i + 1) * (qr_size + spacing_y)
+                    # إحداثيات ركن الخلية العلوي الأيسر
+                    cell_x = x_margin + cidx * cell_w
+                    cell_top = page_h - y_margin - r * cell_h
+
+                    # موضع الـQR: نوسّطه أفقياً وعمودياً داخل الخلية، مع إبقاء النص أسفله
+                    x = cell_x + (cell_w - qr_size) / 2
+                    y = cell_top - text_block_h - inner_pad - qr_size  # يبدأ من أعلى الخلية نزولاً
 
                     c.drawImage(tmp.name, x, y, width=qr_size, height=qr_size)
 
-                    c.setFont(arabic_font, 11)
-                    c.drawCentredString(x + qr_size/2, y - 14, name)
-                    c.drawCentredString(x + qr_size/2, y - 28, rep)
+                    # نصوص أسفل الـQR داخل نفس الخلية
+                    c.setFont(arabic_font, font_size)
+                    text_x = cell_x + cell_w/2
+                    c.drawCentredString(text_x, y - 14, name)
+                    c.drawCentredString(text_x, y - 28, rep)
 
                     count += 1
 
                 c.save()
+
 
                 with open(pdf_name, "rb") as f:
                     st.download_button("⬇️ تحميل ملف PDF", f, file_name=pdf_name, mime="application/pdf")

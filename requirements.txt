@@ -13,3 +13,6 @@ google-cloud-vision>=3.7
 psycopg2-binary>=2.9
 opencv-python-headless>=4.10
 protobuf<5
+pdfplumber
+pymupdf
+

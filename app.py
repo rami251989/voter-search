@@ -140,11 +140,7 @@ if not st.session_state.logged_in:
     st.stop()
 
 # ========================== الواجهة بعد تسجيل الدخول ==========================
-st.title("📊 بغداد - البحث في سجلات الناخبين")
-st.markdown("سيتم البحث في قواعد البيانات باستخدام الذكاء الاصطناعي 🤖")
-
-# ====== تبويبات ======
-tab_browse, tab_single, tab_file, tab_file_name_center, tab_count, tab_check, tab_count_custom, tab_qr, tab_cards_pdf = st.tabs(
+tab_browse, tab_single, tab_file, tab_file_name_center, tab_count, tab_check, tab_count_custom, tab_qr, tab_cards_pdf, tab_pdf_to_table = st.tabs(
     [
         "📄 تصفّح السجلات",
         "🔍 بحث برقم",
@@ -154,9 +150,11 @@ tab_browse, tab_single, tab_file, tab_file_name_center, tab_count, tab_check, ta
         "🧾 التحقق من المعلومات",
         "🧮 تحليل البيانات (COUNT)",
         "🧾 توليد QR PDF",
-        "🖼️ مطابقة البطاقات → PDF"
+        "🖼️ مطابقة البطاقات → PDF",
+        "🧾 PDF → جدول"   # 👈 التاب الجديد
     ]
 )
+
 
 # ========= تحميل خط Amiri لدعم العربية ==========
 FONT_DIR = "fonts"
@@ -1013,3 +1011,184 @@ with tab_qr:
             except Exception as e:
                 st.error(f"❌ حدث خطأ أثناء إنشاء PDF: {e}")
 
+# ----------------------------------------------------------------------------- #
+# 🧾 PDF → جدول (استخراج جداول من PDF + OCR احتياطي)
+# ----------------------------------------------------------------------------- #
+import pdfplumber
+import fitz  # PyMuPDF
+
+with tab_pdf_to_table:
+    st.subheader("🧾 تحويل PDF إلى جدول (Excel/CSV)")
+
+    pdf_file = st.file_uploader("📤 ارفع ملف PDF", type=["pdf"], key="pdf_to_table_uploader")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        edge_tol = st.slider("حساسية اكتشاف حدود الجدول (edge tolerance)", 25, 200, 50, 5,
+                             help="قيمة أعلى = تكتشف جداول أقل (أكثر صرامة)")
+    with col_b:
+        ocr_fallback = st.checkbox("🧠 استخدام OCR عند فشل استخراج الجداول", value=True,
+                                   help="يستخدم Google Vision بعد تحويل الصفحات لصور")
+
+    run_btn = st.button("🚀 تحويل الآن", type="primary")
+
+    def extract_tables_pdfplumber(file_bytes: bytes, edge_tolerance: int = 50):
+        tables = []
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            for pno, page in enumerate(pdf.pages, start=1):
+                # محاولة استخراج جداول بخوارزمية الشبكات
+                try:
+                    # تجربة طريقتين: خطوط + شبكات
+                    for mode in ["lines", "grid"]:
+                        tbs = page.extract_tables({
+                            "vertical_strategy": "lines",
+                            "horizontal_strategy": "lines",
+                            "intersection_tolerance": edge_tolerance
+                        }) if mode == "lines" else page.extract_tables({
+                            "vertical_strategy": "explicit",
+                            "horizontal_strategy": "text",
+                            "explicit_vertical_lines": [],
+                            "explicit_horizontal_lines": [],
+                            "intersection_tolerance": edge_tolerance
+                        })
+                        for tb in tbs or []:
+                            # تنظيف الصفوف الفارغة
+                            clean = [ [ (c or "").strip() for c in row ] for row in tb if any((c or "").strip() for c in row) ]
+                            if not clean:
+                                continue
+                            # استخدم أول صف كعناوين إذا كان مناسب
+                            header = clean[0]
+                            body = clean[1:] if len(clean) > 1 else []
+                            # سدّ الأعمدة الناقصة لثبات الطول
+                            max_len = max(len(r) for r in ([header] + body))
+                            header += [""] * (max_len - len(header))
+                            body = [ r + [""]*(max_len - len(r)) for r in body ]
+                            df = pd.DataFrame(body, columns=[h if h else f"عمود {i+1}" for i, h in enumerate(header)])
+                            df["#صفحة"] = pno
+                            tables.append(df)
+                except Exception:
+                    continue
+        return tables
+
+    def images_from_pdf(file_bytes: bytes, dpi=200):
+        """حوّل صفحات PDF لصور PIL عبر PyMuPDF (لا يحتاج Poppler)."""
+        images = []
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        for pno in range(len(doc)):
+            page = doc[pno]
+            mat = fitz.Matrix(dpi/72, dpi/72)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img_bytes = pix.tobytes("png")
+            images.append(img_bytes)
+        return images
+
+    def ocr_pages_with_vision(img_bytes_list):
+        """OCR لكل صفحة وإرجاع نصوصها كسلاسل."""
+        client = setup_google_vision()
+        if client is None:
+            st.error("❌ تعذّر تهيئة Google Vision.")
+            return []
+        texts = []
+        for idx, ib in enumerate(img_bytes_list, start=1):
+            image = vision.Image(content=ib)
+            resp = client.text_detection(image=image)
+            txt = resp.text_annotations[0].description if resp.text_annotations else ""
+            texts.append(txt)
+        return texts
+
+    def heuristic_lines_to_table(texts):
+        """
+        تحويل بسيط من نصوص مسطّرة إلى جدول عامودين/ثلاثة (مفتاح/قيمة وربما ملاحظة).
+        هذه خطوة احتياطية لوثائق النماذج العربية (حقول: اسم/عدد/محطة...).
+        """
+        rows = []
+        for pno, t in enumerate(texts, start=1):
+            for line in t.splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                # نمط "مفتاح: قيمة"
+                if ":" in s or "：" in s:
+                    parts = re.split(r"[:：]", s, maxsplit=1)
+                    key = parts[0].strip()
+                    val = parts[1].strip() if len(parts) > 1 else ""
+                    rows.append({"الحقل": key, "القيمة": val, "#صفحة": pno})
+                else:
+                    # أرقام مفيدة منفصلة (مثلاً 300، 149، ... إلخ)
+                    m = re.findall(r"\b\d{1,5}\b", s)
+                    if m:
+                        rows.append({"الحقل": s, "القيمة": " / ".join(m), "#صفحة": pno})
+        return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["الحقل","القيمة","#صفحة"])
+
+    if run_btn and pdf_file is not None:
+        try:
+            data = pdf_file.read()
+
+            # 1) المحاولة الأساسية: pdfplumber
+            with st.spinner("🔎 نحاول استخراج الجداول مباشرةً من PDF..."):
+                tables = extract_tables_pdfplumber(data, edge_tolerance=edge_tol)
+
+            if tables:
+                st.success(f"✅ تم العثور على {len(tables)} جدول/جداول")
+                # دمج الجداول كلها في شيتات متعددة للتنزيل
+                # العرض المسبق لأول جدول + خيار تنزيل الكل
+                for i, df in enumerate(tables, start=1):
+                    st.markdown(f"#### جدول {i}")
+                    st.dataframe(df, use_container_width=True, height=360)
+
+                # تنزيل Excel متعدد الشيتات
+                out_xlsx = "pdf_tables.xlsx"
+                with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+                    for i, df in enumerate(tables, start=1):
+                        sheet = f"جدول_{i}"
+                        df.to_excel(writer, index=False, sheet_name=sheet)
+                        ws = writer.book[sheet]
+                        ws.sheet_view.rightToLeft = True
+                with open(out_xlsx, "rb") as f:
+                    st.download_button("⬇️ تحميل Excel (كل الجداول)", f,
+                        file_name=out_xlsx,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+                # تنزيل CSV مجمّع (يلصق الجداول مع عمود يُشير لرقم الجدول)
+                big = pd.concat(
+                    [df.assign(__جدول=i) for i, df in enumerate(tables, start=1)],
+                    ignore_index=True
+                )
+                out_csv = "pdf_tables.csv"
+                big.to_csv(out_csv, index=False, encoding="utf-8-sig")
+                with open(out_csv, "rb") as f:
+                    st.download_button("⬇️ تحميل CSV (مجمّع)", f, file_name=out_csv, mime="text/csv")
+
+            elif ocr_fallback:
+                # 2) احتياطي OCR
+                st.info("ℹ️ لم تُكتشف جداول واضحة. سنجرب OCR (Google Vision).")
+                with st.spinner("🧠 OCR قيد التشغيل..."):
+                    imgs = images_from_pdf(data, dpi=220)
+                    texts = ocr_pages_with_vision(imgs)
+
+                if not texts:
+                    st.error("❌ فشل الـ OCR أو لا يوجد نص مستخرج.")
+                else:
+                    df_lines = heuristic_lines_to_table(texts)
+                    if df_lines.empty:
+                        st.warning("⚠️ لم نتمكن من تنظيم النص إلى جدول.")
+                    else:
+                        st.success("✅ تم تنظيم النص إلى جدول مبسط (مفتاح/قيمة).")
+                        st.dataframe(df_lines, use_container_width=True, height=420)
+
+                        # تنزيلات
+                        out_xlsx = "pdf_ocr_table.xlsx"
+                        df_lines.to_excel(out_xlsx, index=False, engine="openpyxl")
+                        wb = load_workbook(out_xlsx); wb.active.sheet_view.rightToLeft = True; wb.save(out_xlsx)
+                        with open(out_xlsx, "rb") as f:
+                            st.download_button("⬇️ تحميل Excel", f,
+                                file_name=out_xlsx,
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+                        out_csv = "pdf_ocr_table.csv"
+                        df_lines.to_csv(out_csv, index=False, encoding="utf-8-sig")
+                        with open(out_csv, "rb") as f:
+                            st.download_button("⬇️ تحميل CSV", f, file_name=out_csv, mime="text/csv")
+            else:
+                st.warning("⚠️ لم تُكتشف جداول، و(OCR) غير مفعل.")
+        except Exception as e:
+            st.error(f"❌ حدث خطأ أثناء التحويل: {e}")

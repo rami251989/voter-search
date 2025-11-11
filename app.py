@@ -1010,37 +1010,30 @@ with tab_qr:
 
             except Exception as e:
                 st.error(f"❌ حدث خطأ أثناء إنشاء PDF: {e}")
-
 # ----------------------------------------------------------------------------- #
-# 🧾 PDF → جدول (رقم الحزب + عمودي "ت" و "ع ص" من جميع الجداول/الصفحات)
+# 🧾 PDF → جدول (OCR فقط) — استخراج: رقم الحزب + "ت" + "ع ص" من كل الصفحات
 # ----------------------------------------------------------------------------- #
-# يعتمد على: pdfplumber (لاستخراج الجداول النصية) + PyMuPDF/OpenCV/Google Vision (للـ OCR fallback)
-
-import io, re, sys
+import io, re, math
 import numpy as np
 import pandas as pd
-import cv2
-
-# نحاول استيراد pdfplumber و PyMuPDF مع رسائل واضحة إن لم تتوفّر
-_have_pdfplumber = True
-_have_pymupdf = True
-try:
-    import pdfplumber
-except Exception:
-    _have_pdfplumber = False
-try:
-    import fitz  # PyMuPDF
-except Exception:
-    _have_pymupdf = False
+import fitz  # PyMuPDF
 
 with tab_pdf_to_table:
-    st.subheader("🧾 PDF → جدول (رقم الحزب + ت/ع ص)")
+    st.subheader("🧾 تحويل PDF إلى جدول عبر Google OCR فقط")
 
-    pdf_file = st.file_uploader("📤 ارفع ملف PDF", type=["pdf"], key="pdf_to_table_party")
-    run_btn  = st.button("🚀 استخراج الآن", type="primary", key="pdf_to_table_run")
+    pdf_file = st.file_uploader("📤 ارفع ملف PDF", type=["pdf"], key="pdf_to_table_ocr_only")
+    col1, col2 = st.columns(2)
+    with col1:
+        row_tol = st.slider("حساسية تجميع الصفوف (px)", 5, 40, 14, 1,
+                            help="قيمة أكبر = صفوف أقل (أكثر صرامة). تعتمد على دقة الصورة.")
+    with col2:
+        dpi = st.slider("دقّة تحويل الصفحة إلى صورة (DPI)", 150, 350, 260, 10,
+                        help="ارفعها إذا كان النص صغيراً.")
 
-    # ---------------- أدوات مساعدة عامة ----------------
-    def ar_clean(s: str) -> str:
+    run_btn = st.button("🚀 استخراج الآن (OCR)", type="primary", key="run_pdf_ocr_only")
+
+    # ---------- أدوات مساعدة ----------
+    def ar_norm(s: str) -> str:
         if s is None: return ""
         s = str(s)
         s = s.replace(" ", "").replace("\u200f","").replace("\u200e","")
@@ -1048,303 +1041,177 @@ with tab_pdf_to_table:
                .replace("ؤ","و").replace("ئ","ي").replace("ى","ي").replace("ة","ه"))
         return s
 
-    def find_party_number(text: str) -> str | None:
-        if not text: return None
-        m = re.search(r"اسم\s*الحزب\s*[:：]\s*(\d+)", text)
-        return m.group(1) if m else None
-
-    def pick_cols_te_as(df: pd.DataFrame) -> pd.DataFrame | None:
-        if df is None or df.empty:
-            return None
-        # تنظيف رؤوس الأعمدة
-        cols = [ar_clean(c if c else f"c{i}") for i, c in enumerate(df.columns)]
-        col_map = dict(zip(df.columns, cols))
-        # مرشّحات
-        te_candidates = [c for c, cc in col_map.items() if cc == "ت"]
-        as_candidates = [c for c, cc in col_map.items() if ("ع" in cc and "ص" in cc)]
-        # احتياطي عددي
-        if not te_candidates:
-            numeric_like = [c for c in df.columns if pd.to_numeric(df[c], errors="coerce").notna().mean() > 0.8]
-            te_candidates = numeric_like[:1] if numeric_like else []
-        if not as_candidates:
-            numeric_like = [c for c in df.columns if pd.to_numeric(df[c], errors="coerce").notna().mean() > 0.8]
-            if len(numeric_like) >= 2:
-                as_candidates = [numeric_like[-1]]
-        if not te_candidates or not as_candidates:
-            return None
-
-        te_col, as_col = te_candidates[0], as_candidates[0]
-        out = df[[te_col, as_col]].copy()
-        out.columns = ["ت", "ع ص"]
-
-        for c in ["ت","ع ص"]:
-            out[c] = out[c].astype(str).str.strip().replace({"": None, "nan": None, "None": None})
-        out["ت"]   = pd.to_numeric(out["ت"], errors="coerce")
-        out["ع ص"] = pd.to_numeric(out["ع ص"], errors="coerce")
-        out = out.dropna(subset=["ت","ع ص"]).astype({"ت":"int64","ع ص":"int64"}).reset_index(drop=True)
-        return out
-
-    # ---------------- خطوط OCR مساعدة ----------------
-    def party_no_from_page_pdfplumber(pdf_obj, page_index: int) -> str | None:
-        try:
-            txt = pdf_obj.pages[page_index].extract_text() or ""
-            return find_party_number(txt)
-        except Exception:
-            return None
-
-    def party_no_from_image_bytes(img_bytes: bytes) -> str | None:
-        client = setup_google_vision()
-        if client is None:
-            return None
-        image = vision.Image(content=img_bytes)
-        resp = client.text_detection(image=image)
-        txt = resp.text_annotations[0].description if resp.text_annotations else ""
-        return find_party_number(txt)
-
-    def render_page_png(doc, pno, dpi=230) -> bytes:
+    def render_page_png_bytes(pdf_bytes: bytes, page_index: int, dpi: int) -> bytes:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        page = doc[page_index]
         mat = fitz.Matrix(dpi/72, dpi/72)
-        pix = doc[pno-1].get_pixmap(matrix=mat, alpha=False)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
         return pix.tobytes("png")
 
-    # --- كاشف شبكة الجداول + OCR للخلايا ---
-    def detect_table_cells(img_bgr):
-        """
-        يرجّع (rows, flat) حيث rows = قائمة صفوف، كل صف قائمة خلايا (x,y,w,h) مرتبة.
-        """
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                    cv2.THRESH_BINARY_INV, 31, 9)
-        H, W = gray.shape[:2]
-        vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(20, H//35)))
-        hori_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(20, W//35), 1))
-        v_lines = cv2.morphologyEx(thr, cv2.MORPH_OPEN, vert_kernel, iterations=1)
-        h_lines = cv2.morphologyEx(thr, cv2.MORPH_OPEN, hori_kernel, iterations=1)
-        grid = cv2.add(v_lines, h_lines)
-
-        contours, _ = cv2.findContours(grid, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        boxes = []
-        for cnt in contours:
-            x,y,w,h = cv2.boundingRect(cnt)
-            if w < 25 or h < 20: 
-                continue
-            if w*h < 800: 
-                continue
-            if w > W*0.95 or h > H*0.95: 
-                continue
-            boxes.append((x,y,w,h))
-        if not boxes:
-            return [], []
-
-        boxes = sorted(boxes, key=lambda b: (b[1], b[0]))  # sort by y then x
-        rows = []
-        current = [boxes[0]]
-        for b in boxes[1:]:
-            if abs(b[1] - current[-1][1]) < 15:
-                current.append(b)
-            else:
-                rows.append(sorted(current, key=lambda r: r[0]))
-                current = [b]
-        rows.append(sorted(current, key=lambda r: r[0]))
-
-        max_cols = max(len(r) for r in rows)
-        norm_rows = [r for r in rows if len(r) >= max(2, int(0.6*max_cols))]
-        flat = [c for r in norm_rows for c in r]
-        return norm_rows, flat
-
-    def ocr_cell(bgr, box) -> str:
-        x,y,w,h = box
-        pad = 4
-        y0 = max(0, y+pad); x0 = max(0, x+pad)
-        y1 = min(bgr.shape[0], y+h-pad); x1 = min(bgr.shape[1], x+w-pad)
-        crop = bgr[y0:y1, x0:x1]
-        ok, buf = cv2.imencode(".png", crop)
-        if not ok: 
-            return ""
+    def ocr_full_annotation(img_bytes: bytes):
         client = setup_google_vision()
         if client is None:
-            return ""
-        image = vision.Image(content=buf.tobytes())
-        resp = client.text_detection(image=image)
-        return (resp.text_annotations[0].description if resp.text_annotations else "").strip()
+            raise RuntimeError("Vision client not configured.")
+        image = vision.Image(content=img_bytes)
+        # نستخدم DOCUMENT_TEXT_DETECTION للحصول على البلوكات/الكلمات مع الإحداثيات
+        resp = client.document_text_detection(image=image, image_context={"language_hints": ["ar"]})
+        return resp.full_text_annotation
 
-    def normalize_header(txt):
-        txt = (txt or "").strip()
-        txt = txt.replace(" ", "")
-        txt = txt.replace("أ","ا").replace("إ","ا").replace("آ","ا").replace("ى","ي").replace("ة","ه")
-        return txt
+    def extract_party_number(full_text: str) -> str | None:
+        if not full_text: return None
+        m = re.search(r"اسم\s*الحزب\s*[:：]\s*(\d+)", full_text)
+        return m.group(1) if m else None
 
-    # ---------------- التنفيذ الرئيسي ----------------
-    if run_btn and pdf_file is not None:
-        data = pdf_file.read()
-
-        # إن لم يوجد pdfplumber ولا PyMuPDF لا يمكن المتابعة
-        if not _have_pdfplumber and not _have_pymupdf:
-            st.error("❌ تحتاج لتثبيت المكتبتين: `pdfplumber` و `pymupdf` لتشغيل هذا التبويب.")
-            st.stop()
-
-        final_rows = []  # سنجمع النتيجة هنا
-
-        # --------- المرحلة 1: pdfplumber (لو متاح) ----------
-        used_pdfplumber = False
-        if _have_pdfplumber:
-            try:
-                with pdfplumber.open(io.BytesIO(data)) as pdf_obj:
-                    total_pages = len(pdf_obj.pages)
-                    progress = st.progress(0, text="🔎 محاولة استخراج الجداول بالنص…")
-
-                    # إن كنا سنحتاج OCR للرقم، نفتح PyMuPDF عند الضرورة
-                    doc = fitz.open(stream=data, filetype="pdf") if _have_pymupdf else None
-
-                    for pno, page in enumerate(pdf_obj.pages, start=1):
-                        party_no = party_no_from_page_pdfplumber(pdf_obj, pno-1)
-                        if party_no is None and _have_pymupdf:
-                            try:
-                                img_bytes = render_page_png(doc, pno, dpi=230)
-                                party_no = party_no_from_image_bytes(img_bytes)
-                            except Exception:
-                                party_no = None
-
-                        tables = page.extract_tables({
-                            "vertical_strategy": "lines",
-                            "horizontal_strategy": "lines",
-                            "intersection_tolerance": 50
-                        }) or []
-
-                        for t_idx, tb in enumerate(tables, start=1):
-                            clean = [[(c or "").strip() for c in row] for row in tb if any((c or "").strip() for c in row)]
-                            if not clean:
-                                continue
-                            header = clean[0]
-                            body   = clean[1:] if len(clean) > 1 else []
-                            max_len = max(len(r) for r in ([header] + body))
-                            header += [""]*(max_len-len(header))
-                            body   = [r + [""]*(max_len-len(r)) for r in body]
-                            df_tb  = pd.DataFrame(body, columns=[h if h else f"عمود {i+1}" for i,h in enumerate(header)])
-
-                            picked = pick_cols_te_as(df_tb)
-                            if picked is None or picked.empty:
-                                continue
-                            picked.insert(0, "رقم الحزب", party_no if party_no is not None else "")
-                            picked["#صفحة"] = pno
-                            picked["#جدول_في_الصفحة"] = t_idx
-                            final_rows.append(picked)
-
-                        progress.progress(pno/total_pages, text=f"🔎 صفحة {pno}/{total_pages}…")
-
-                used_pdfplumber = True
-            except Exception as e:
-                st.info(f"ℹ️ pdfplumber فشل أو الملف مصوّر: {e}")
-
-        # إذا نجحنا واستخراجنا صفوف، نعرض وننهي
-        if final_rows:
-            result_df = pd.concat(final_rows, ignore_index=True)
-            st.success(f"✅ تم استخراج {len(result_df)} صف بواسطة pdfplumber.")
-            st.dataframe(result_df, use_container_width=True, height=420)
-            out_xlsx = "نتائج_الاحزاب_والمرشحين.xlsx"
-            with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
-                result_df.to_excel(writer, index=False, sheet_name="نتائج")
-                ws = writer.book["نتائج"]; ws.sheet_view.rightToLeft = True
-            with open(out_xlsx, "rb") as f:
-                st.download_button("⬇️ تحميل Excel", f, file_name=out_xlsx,
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            out_csv = "نتائج_الاحزاب_والمرشحين.csv"
-            result_df.to_csv(out_csv, index=False, encoding="utf-8-sig")
-            with open(out_csv, "rb") as f:
-                st.download_button("⬇️ تحميل CSV", f, file_name=out_csv, mime="text/csv")
-            st.stop()
-
-        # --------- المرحلة 2: OCR GRID (fallback) ----------
-        if not _have_pymupdf:
-            st.error("❌ لم يتم العثور على جداول، وPyMuPDF غير مثبت، فلا يمكن تشغيل OCR Grid Parser.\nثبت: `pymupdf`")
-            st.stop()
-
-        st.info("ℹ️ سنجرب محلّل الجداول بالصور (OCR Grid Parser)…")
-        doc = fitz.open(stream=data, filetype="pdf")
-
-        ocr_rows_all = []
-        total_pages = doc.page_count
-        progress2 = st.progress(0, text="🔧 OCR Grid…")
-
-        for pno in range(1, total_pages+1):
-            try:
-                png_bytes = render_page_png(doc, pno, dpi=260)
-                img = cv2.imdecode(np.frombuffer(png_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-
-                rows, flat = detect_table_cells(img)
-                if not rows:
-                    progress2.progress(pno/total_pages, text=f"صفحة {pno}/{total_pages}: لم يُكتشف جدول")
-                    continue
-
-                # نفترض أول صف رؤوس أعمدة
-                header_cells = rows[0]
-                headers = [normalize_header(ocr_cell(img, b)) for b in header_cells]
-
-                idx_te = None; idx_as = None
-                for i, h in enumerate(headers):
-                    if h == "ت": idx_te = i
-                    if ("ع" in h and "ص" in h): idx_as = i
-
-                if idx_te is None or idx_as is None:
-                    numeric_score = [0]*len(headers)
-                    for r in rows[1: min(len(rows), 4)]:
-                        for i, b in enumerate(r):
-                            val = ocr_cell(img, b)
-                            if re.fullmatch(r"\d+", val or ""): numeric_score[i] += 1
-                    cand = sorted(range(len(headers)), key=lambda i: -numeric_score[i])[:2]
-                    if len(cand) == 2:
-                        idx_te, idx_as = cand[0], cand[1]
-
-                if idx_te is None or idx_as is None:
-                    progress2.progress(pno/total_pages, text=f"صفحة {pno}/{total_pages}: فشل تحديد أعمدة ت/ع ص")
-                    continue
-
-                # رقم الحزب (من نص الصفحة إن أمكن، وإلا OCR)
-                party_no = ""
-                if _have_pdfplumber:
-                    try:
-                        with pdfplumber.open(io.BytesIO(data)) as pdf_tmp:
-                            party_no = party_no_from_page_pdfplumber(pdf_tmp, pno-1) or ""
-                    except Exception:
-                        party_no = ""
-                if not party_no:
-                    party_no = party_no_from_image_bytes(png_bytes) or ""
-
-                # قراءة بقية الصفوف
-                for r in rows[1:]:
-                    if idx_te >= len(r) or idx_as >= len(r): 
+    def words_from_annotation(page):
+        """يرجع قائمة كلمات: [{'text', 'cx', 'cy', 'x0','y0','x1','y1'}] لكل صفحة."""
+        words = []
+        for block in page.blocks:
+            for para in block.paragraphs:
+                for word in para.words:
+                    txt = "".join([s.text for s in word.symbols]) if hasattr(word, "symbols") else word.text
+                    if not txt: 
                         continue
-                    txt_te = ocr_cell(img, r[idx_te])
-                    txt_as = ocr_cell(img, r[idx_as])
-                    if not (re.fullmatch(r"\d+", txt_te or "") and re.fullmatch(r"\d+", txt_as or "")):
-                        continue
-                    ocr_rows_all.append({
-                        "رقم الحزب": party_no,
-                        "ت": int(txt_te),
-                        "ع ص": int(txt_as),
-                        "#صفحة": pno,
-                        "#جدول_في_الصفحة": 1
+                    # متوسط الإحداثيات
+                    xs = [v.x for v in word.bounding_box.vertices]
+                    ys = [v.y for v in word.bounding_box.vertices]
+                    cx = sum(xs) / 4.0
+                    cy = sum(ys) / 4.0
+                    words.append({
+                        "text": txt,
+                        "norm": ar_norm(txt),
+                        "cx": cx, "cy": cy,
+                        "x0": min(xs), "y0": min(ys),
+                        "x1": max(xs), "y1": max(ys),
                     })
+        return words
 
-                progress2.progress(pno/total_pages, text=f"صفحة {pno}/{total_pages}: تمت معالجة OCR Grid")
-            except Exception as e:
-                progress2.progress(pno/total_pages, text=f"صفحة {pno}/{total_pages}: خطأ {e}")
+    def group_rows(words, tol):
+        """يجمع الكلمات إلى صفوف حسب قرب الإحداثي Y (cy)."""
+        if not words: return []
+        # Sort by cy
+        words = sorted(words, key=lambda w: w["cy"])
+        rows = []
+        current = [words[0]]
+        for w in words[1:]:
+            if abs(w["cy"] - current[-1]["cy"]) <= tol:
+                current.append(w)
+            else:
+                rows.append(sorted(current, key=lambda x: x["cx"]))
+                current = [w]
+        rows.append(sorted(current, key=lambda x: x["cx"]))
+        return rows
 
-        if ocr_rows_all:
-            result_df = pd.DataFrame(ocr_rows_all)
-            st.success(f"✅ تم استخراج {len(result_df)} صف بواسطة OCR Grid Parser.")
-            st.dataframe(result_df, use_container_width=True, height=420)
+    def choose_header_indices(rows):
+        """
+        يحدد صف العناوين الذي يحوي خلية 'ت' وخلية فيها 'ع' و'ص'.
+        يرجع (row_idx, te_x, as_x) حيث te_x/as_x مواقع مراكز الأعمدة.
+        """
+        for idx, row in enumerate(rows[:8]):  # نتوقع العناوين في الأعلى
+            te_candidates = [w for w in row if w["norm"] == "ت"]
+            as_candidates = [w for w in row if ("ع" in w["norm"] and "ص" in w["norm"])]
+            if te_candidates and as_candidates:
+                te_x = te_candidates[0]["cx"]
+                # خذ الكلمة الأقرب التي تحتوي "ع" و"ص" (قد تكون "عص" أو "ع ص")
+                as_word = sorted(as_candidates, key=lambda w: w["cx"])[0]
+                as_x = as_word["cx"]
+                return idx, te_x, as_x
+        return None, None, None
 
-            out_xlsx = "نتائج_الاحزاب_والمرشحين_OCR.xlsx"
-            with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
-                result_df.to_excel(writer, index=False, sheet_name="نتائج")
-                ws = writer.book["نتائج"]; ws.sheet_view.rightToLeft = True
-            with open(out_xlsx, "rb") as f:
-                st.download_button("⬇️ تحميل Excel (OCR)", f, file_name=out_xlsx,
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    def nearest_numeric(row_words, target_x, x_tolerance_ratio=0.15):
+        """
+        يأخذ كلمات صف واحد ويختار الكلمة الرقمية الأقرب أفقياً إلى target_x.
+        x_tolerance_ratio يحدد سماحية الانحراف نسبة لعرض الصف.
+        """
+        if not row_words: return None
+        # مجال X الكلي للصف
+        x_min = min(w["cx"] for w in row_words)
+        x_max = max(w["cx"] for w in row_words)
+        x_tol = max(12.0, (x_max - x_min) * x_tolerance_ratio)
 
-            out_csv = "نتائج_الاحزاب_والمرشحين_OCR.csv"
-            result_df.to_csv(out_csv, index=False, encoding="utf-8-sig")
-            with open(out_csv, "rb") as f:
-                st.download_button("⬇️ تحميل CSV (OCR)", f, file_name=out_csv, mime="text/csv")
-        else:
-            st.error("❌ لم نتمكن من استخراج جداول حتى عبر OCR Grid. ارفع نسخة أوضح/بدقّة أعلى أو أرسل عيّنة لأضبط العتبات.")
+        numeric = [w for w in row_words if re.fullmatch(r"\d+", w["text"].strip())]
+        if not numeric: 
+            return None
+        # الأقرب أفقياً
+        candidate = min(numeric, key=lambda w: abs(w["cx"] - float(target_x)))
+        if abs(candidate["cx"] - float(target_x)) <= x_tol:
+            return int(candidate["text"])
+        return None
+
+    def extract_table_from_page(words, row_tol):
+        """
+        يرجع DataFrame لأعمدة ('ت','ع ص') لكل صفحة.
+        يعتمد على إيجاد صف العناوين ومركزي عمودَي ت و ع ص.
+        """
+        rows = group_rows(words, tol=row_tol)
+        hdr_idx, te_x, as_x = choose_header_indices(rows)
+        if hdr_idx is None:
+            return pd.DataFrame(columns=["ت","ع ص"])
+
+        out = []
+        for r in rows[hdr_idx+1:]:
+            te_val = nearest_numeric(r, te_x)
+            as_val = nearest_numeric(r, as_x)
+            if te_val is not None and as_val is not None:
+                out.append({"ت": te_val, "ع ص": as_val})
+        return pd.DataFrame(out)
+
+    if run_btn and pdf_file is not None:
+        try:
+            pdf_bytes = pdf_file.read()
+            # عدد الصفحات
+            doc_tmp = fitz.open(stream=pdf_bytes, filetype="pdf")
+            total_pages = doc_tmp.page_count
+            progress = st.progress(0, text="جاري المعالجة…")
+
+            all_rows = []
+            for p in range(total_pages):
+                # 1) تحويل الصفحة لصورة
+                img_bytes = render_page_png_bytes(pdf_bytes, p, dpi=dpi)
+                # 2) OCR كامل للصفحة
+                annotation = ocr_full_annotation(img_bytes)
+                if not annotation or not annotation.pages:
+                    progress.progress((p+1)/total_pages, text=f"صفحة {p+1}/{total_pages}: لا يوجد نص")
+                    continue
+
+                # 3) رقم الحزب
+                full_text = annotation.text or ""
+                party_no = extract_party_number(full_text) or ""
+
+                # 4) تجميع الكلمات مع الإحداثيات لهذه الصفحة
+                # (full_text_annotation.pages هو هيكل Vision؛ نمر على أول صفحة فقط في هذه الصورة)
+                page_ann = annotation.pages[0]
+                words = words_from_annotation(page_ann)
+
+                # 5) استخراج جدول هذه الصفحة
+                df_page = extract_table_from_page(words, row_tol=row_tol)
+
+                # 6) دمج وإضافة معلومات الصفحة
+                if not df_page.empty:
+                    df_page.insert(0, "رقم الحزب", party_no)
+                    df_page["#صفحة"] = p + 1
+                    all_rows.append(df_page)
+
+                progress.progress((p+1)/total_pages, text=f"صفحة {p+1}/{total_pages} تمت")
+
+            if all_rows:
+                result_df = pd.concat(all_rows, ignore_index=True)
+                st.success(f"✅ تم استخراج {len(result_df)} صف من كل الصفحات عبر OCR فقط.")
+                st.dataframe(result_df, use_container_width=True, height=430)
+
+                out_xlsx = "نتائج_الاحزاب_والمرشحين_OCROnly.xlsx"
+                with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+                    result_df.to_excel(writer, index=False, sheet_name="نتائج")
+                    ws = writer.book["نتائج"]; ws.sheet_view.rightToLeft = True
+                with open(out_xlsx, "rb") as f:
+                    st.download_button("⬇️ تحميل Excel", f, file_name=out_xlsx,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+                out_csv = "نتائج_الاحزاب_والمرشحين_OCROnly.csv"
+                result_df.to_csv(out_csv, index=False, encoding="utf-8-sig")
+                with open(out_csv, "rb") as f:
+                    st.download_button("⬇️ تحميل CSV", f, file_name=out_csv, mime="text/csv")
+            else:
+                st.error("❌ لم نتمكن من استخراج أي صف. جرّب زيادة DPI أو تقليل حساسية الصفوف.")
+
+        except Exception as e:
+            st.error(f"❌ حدث خطأ أثناء OCR: {e}")

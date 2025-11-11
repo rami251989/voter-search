@@ -1010,185 +1010,183 @@ with tab_qr:
 
             except Exception as e:
                 st.error(f"❌ حدث خطأ أثناء إنشاء PDF: {e}")
-
 # ----------------------------------------------------------------------------- #
-# 🧾 PDF → جدول (استخراج جداول من PDF + OCR احتياطي)
+# 🧾 PDF → جدول (استخراج: رقم الحزب + عمودَي "ت" و "ع ص" من كل الجداول بكل الصفحات)
 # ----------------------------------------------------------------------------- #
+import re, io
 import pdfplumber
 import fitz  # PyMuPDF
 
 with tab_pdf_to_table:
-    st.subheader("🧾 تحويل PDF إلى جدول (Excel/CSV)")
+    st.subheader("🧾 استخراج الجداول من PDF (رقم الحزب + ت/ع ص)")
 
-    pdf_file = st.file_uploader("📤 ارفع ملف PDF", type=["pdf"], key="pdf_to_table_uploader")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        edge_tol = st.slider("حساسية اكتشاف حدود الجدول (edge tolerance)", 25, 200, 50, 5,
-                             help="قيمة أعلى = تكتشف جداول أقل (أكثر صرامة)")
-    with col_b:
-        ocr_fallback = st.checkbox("🧠 استخدام OCR عند فشل استخراج الجداول", value=True,
-                                   help="يستخدم Google Vision بعد تحويل الصفحات لصور")
+    st.markdown("""
+    **الوصف:**
+    - يقرأ كل صفحة في الملف، يلتقط **رقم الحزب** من نص الصفحة (بدون اسم الحزب).
+    - يستخرج كل الجداول ويحتفظ فقط بعمود **ت** (تسلسل المرشح) وعمود **ع ص** (عدد الأصوات).
+    - يدمج كل النتائج في جدول واحد مع أعمدة إضافية (#صفحة، #جدول_في_الصفحة).
+    - إذا تعذر التقاط رقم الحزب من نص الصفحة، يحاول قراءة الصفحة صورةً عبر **Google Vision** (OCR) لاستخراج الرقم فقط.
+    """)
 
-    run_btn = st.button("🚀 تحويل الآن", type="primary")
+    pdf_file = st.file_uploader("📤 ارفع ملف PDF", type=["pdf"], key="pdf_to_table_party")
+    run_btn  = st.button("🚀 استخراج الآن", type="primary", key="pdf_to_table_run")
 
-    def extract_tables_pdfplumber(file_bytes: bytes, edge_tolerance: int = 50):
-        tables = []
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            for pno, page in enumerate(pdf.pages, start=1):
-                # محاولة استخراج جداول بخوارزمية الشبكات
-                try:
-                    # تجربة طريقتين: خطوط + شبكات
-                    for mode in ["lines", "grid"]:
-                        tbs = page.extract_tables({
-                            "vertical_strategy": "lines",
-                            "horizontal_strategy": "lines",
-                            "intersection_tolerance": edge_tolerance
-                        }) if mode == "lines" else page.extract_tables({
-                            "vertical_strategy": "explicit",
-                            "horizontal_strategy": "text",
-                            "explicit_vertical_lines": [],
-                            "explicit_horizontal_lines": [],
-                            "intersection_tolerance": edge_tolerance
-                        })
-                        for tb in tbs or []:
-                            # تنظيف الصفوف الفارغة
-                            clean = [ [ (c or "").strip() for c in row ] for row in tb if any((c or "").strip() for c in row) ]
-                            if not clean:
-                                continue
-                            # استخدم أول صف كعناوين إذا كان مناسب
-                            header = clean[0]
-                            body = clean[1:] if len(clean) > 1 else []
-                            # سدّ الأعمدة الناقصة لثبات الطول
-                            max_len = max(len(r) for r in ([header] + body))
-                            header += [""] * (max_len - len(header))
-                            body = [ r + [""]*(max_len - len(r)) for r in body ]
-                            df = pd.DataFrame(body, columns=[h if h else f"عمود {i+1}" for i, h in enumerate(header)])
-                            df["#صفحة"] = pno
-                            tables.append(df)
-                except Exception:
-                    continue
-        return tables
+    # ---------- أدوات مساعدة ----------
+    def ar_clean(s: str) -> str:
+        """تطبيع بسيط للعناوين العربية: إزالة مسافات وتوحيد بعض الحروف."""
+        if s is None: return ""
+        s = str(s)
+        s = s.replace(" ", "").replace("\u200f","").replace("\u200e","")
+        s = (s.replace("أ","ا").replace("إ","ا").replace("آ","ا")
+               .replace("ؤ","و").replace("ئ","ي").replace("ى","ي").replace("ة","ه"))
+        return s
 
-    def images_from_pdf(file_bytes: bytes, dpi=200):
-        """حوّل صفحات PDF لصور PIL عبر PyMuPDF (لا يحتاج Poppler)."""
-        images = []
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        for pno in range(len(doc)):
-            page = doc[pno]
-            mat = fitz.Matrix(dpi/72, dpi/72)
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            img_bytes = pix.tobytes("png")
-            images.append(img_bytes)
-        return images
+    def find_party_number(text: str) -> str | None:
+        """
+        يلتقط أول رقم بعد عبارة 'اسم الحزب:' مثل:
+        'اسم الحزب: 207، ائتلاف ...'
+        """
+        if not text: return None
+        m = re.search(r"اسم\s*الحزب\s*[:：]\s*(\d+)", text)
+        return m.group(1) if m else None
 
-    def ocr_pages_with_vision(img_bytes_list):
-        """OCR لكل صفحة وإرجاع نصوصها كسلاسل."""
+    def page_party_number_pdfplumber(pdf_obj, page_index: int) -> str | None:
+        try:
+            txt = pdf_obj.pages[page_index].extract_text() or ""
+            return find_party_number(txt)
+        except Exception:
+            return None
+
+    def page_party_number_ocr(img_bytes: bytes) -> str | None:
+        # يستخدم نفس إعداداتك لمفاتيح Google Vision
         client = setup_google_vision()
         if client is None:
-            st.error("❌ تعذّر تهيئة Google Vision.")
-            return []
-        texts = []
-        for idx, ib in enumerate(img_bytes_list, start=1):
-            image = vision.Image(content=ib)
-            resp = client.text_detection(image=image)
-            txt = resp.text_annotations[0].description if resp.text_annotations else ""
-            texts.append(txt)
-        return texts
+            return None
+        image = vision.Image(content=img_bytes)
+        resp = client.text_detection(image=image)
+        txt = resp.text_annotations[0].description if resp.text_annotations else ""
+        return find_party_number(txt)
 
-    def heuristic_lines_to_table(texts):
+    def pick_cols_te_as(df: pd.DataFrame) -> pd.DataFrame | None:
         """
-        تحويل بسيط من نصوص مسطّرة إلى جدول عامودين/ثلاثة (مفتاح/قيمة وربما ملاحظة).
-        هذه خطوة احتياطية لوثائق النماذج العربية (حقول: اسم/عدد/محطة...).
+        نختار فقط عمودي 'ت' (تسلسل) و'ع ص' (عدد الأصوات)
+        حتى لو العناوين مكتوبة *ت*, *عص*, *ع ص*, أو فارغة.
         """
-        rows = []
-        for pno, t in enumerate(texts, start=1):
-            for line in t.splitlines():
-                s = line.strip()
-                if not s:
-                    continue
-                # نمط "مفتاح: قيمة"
-                if ":" in s or "：" in s:
-                    parts = re.split(r"[:：]", s, maxsplit=1)
-                    key = parts[0].strip()
-                    val = parts[1].strip() if len(parts) > 1 else ""
-                    rows.append({"الحقل": key, "القيمة": val, "#صفحة": pno})
-                else:
-                    # أرقام مفيدة منفصلة (مثلاً 300، 149، ... إلخ)
-                    m = re.findall(r"\b\d{1,5}\b", s)
-                    if m:
-                        rows.append({"الحقل": s, "القيمة": " / ".join(m), "#صفحة": pno})
-        return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["الحقل","القيمة","#صفحة"])
+        if df is None or df.empty:
+            return None
+
+        # نظّف العناوين
+        cols = [ar_clean(c if c else f"c{i}") for i, c in enumerate(df.columns)]
+        col_map = dict(zip(df.columns, cols))
+
+        # مرشح 'ت' = عنوان بالضبط "ت"
+        te_candidates = [c for c, cc in col_map.items() if cc == "ت"]
+        # مرشح 'ع ص' يحتوي حرفي "ع" و"ص"
+        as_candidates = [c for c, cc in col_map.items() if ("ع" in cc and "ص" in cc)]
+
+        # احتياط ذكي إن لم نجد عناوين صريحة
+        if not te_candidates:
+            numeric_like = [c for c in df.columns if pd.to_numeric(df[c], errors="coerce").notna().mean() > 0.8]
+            te_candidates = numeric_like[:1] if numeric_like else []
+        if not as_candidates:
+            numeric_like = [c for c in df.columns if pd.to_numeric(df[c], errors="coerce").notna().mean() > 0.8]
+            if len(numeric_like) >= 2:
+                as_candidates = [numeric_like[-1]]
+
+        if not te_candidates or not as_candidates:
+            return None
+
+        te_col = te_candidates[0]
+        as_col = as_candidates[0]
+
+        out = df[[te_col, as_col]].copy()
+        out.columns = ["ت", "ع ص"]
+
+        # تنظيف القيم
+        for c in ["ت","ع ص"]:
+            out[c] = out[c].astype(str).str.strip()
+            out[c] = out[c].replace({"": None, "nan": None, "None": None})
+
+        # إبقاء الصفوف الرقمية فقط
+        out["ت"]   = pd.to_numeric(out["ت"], errors="coerce")
+        out["ع ص"] = pd.to_numeric(out["ع ص"], errors="coerce")
+        out = out.dropna(subset=["ت","ع ص"]).astype({"ت":"int64","ع ص":"int64"}).reset_index(drop=True)
+        return out
 
     if run_btn and pdf_file is not None:
         try:
             data = pdf_file.read()
+            final_rows = []  # سنجمع كل النتائج من كل الجداول في كل الصفحات
 
-            # 1) المحاولة الأساسية: pdfplumber
-            with st.spinner("🔎 نحاول استخراج الجداول مباشرةً من PDF..."):
-                tables = extract_tables_pdfplumber(data, edge_tolerance=edge_tol)
+            with pdfplumber.open(io.BytesIO(data)) as pdf_obj:
+                # نحتاج أيضاً فتح بنفس الوقت عبر PyMuPDF لإنتاج صورة عند الحاجة لـ OCR
+                doc = fitz.open(stream=data, filetype="pdf")
 
-            if tables:
-                st.success(f"✅ تم العثور على {len(tables)} جدول/جداول")
-                # دمج الجداول كلها في شيتات متعددة للتنزيل
-                # العرض المسبق لأول جدول + خيار تنزيل الكل
-                for i, df in enumerate(tables, start=1):
-                    st.markdown(f"#### جدول {i}")
-                    st.dataframe(df, use_container_width=True, height=360)
+                progress = st.progress(0)
+                total_pages = len(pdf_obj.pages)
 
-                # تنزيل Excel متعدد الشيتات
-                out_xlsx = "pdf_tables.xlsx"
+                for pno, page in enumerate(pdf_obj.pages, start=1):
+                    # 1) رقم الحزب من نص الصفحة (أو OCR احتياطي)
+                    party_no = page_party_number_pdfplumber(pdf_obj, pno-1)
+                    if party_no is None:
+                        try:
+                            mat = fitz.Matrix(200/72, 200/72)
+                            pix = doc[pno-1].get_pixmap(matrix=mat, alpha=False)
+                            img_bytes = pix.tobytes("png")
+                            party_no = page_party_number_ocr(img_bytes)
+                        except Exception:
+                            party_no = None
+
+                    # 2) استخراج الجداول (نمط الخطوط أولاً)
+                    page_tables = page.extract_tables({
+                        "vertical_strategy": "lines",
+                        "horizontal_strategy": "lines",
+                        "intersection_tolerance": 50
+                    }) or []
+
+                    # حوّل كل جدول إلى DataFrame وحافظ فقط على (ت, ع ص)
+                    for t_idx, tb in enumerate(page_tables, start=1):
+                        clean = [[(c or "").strip() for c in row] for row in tb if any((c or "").strip() for c in row)]
+                        if not clean:
+                            continue
+                        header = clean[0]
+                        body   = clean[1:] if len(clean) > 1 else []
+                        max_len = max(len(r) for r in ([header] + body))
+                        header += [""]*(max_len-len(header))
+                        body   = [r + [""]*(max_len-len(r)) for r in body]
+                        df_tb  = pd.DataFrame(body, columns=[h if h else f"عمود {i+1}" for i,h in enumerate(header)])
+
+                        picked = pick_cols_te_as(df_tb)
+                        if picked is None or picked.empty:
+                            continue
+
+                        picked.insert(0, "رقم الحزب", party_no if party_no is not None else "")
+                        picked["#صفحة"] = pno
+                        picked["#جدول_في_الصفحة"] = t_idx
+                        final_rows.append(picked)
+
+                    progress.progress(pno/total_pages)
+
+            # 3) عرض وتنزيل
+            if final_rows:
+                result_df = pd.concat(final_rows, ignore_index=True)
+                st.success(f"✅ تم استخراج {len(result_df)} صف من جميع الجداول.")
+                st.dataframe(result_df, use_container_width=True, height=420)
+
+                out_xlsx = "نتائج_الاحزاب_والمرشحين.xlsx"
                 with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
-                    for i, df in enumerate(tables, start=1):
-                        sheet = f"جدول_{i}"
-                        df.to_excel(writer, index=False, sheet_name=sheet)
-                        ws = writer.book[sheet]
-                        ws.sheet_view.rightToLeft = True
+                    result_df.to_excel(writer, index=False, sheet_name="نتائج")
+                    ws = writer.book["نتائج"]; ws.sheet_view.rightToLeft = True
                 with open(out_xlsx, "rb") as f:
-                    st.download_button("⬇️ تحميل Excel (كل الجداول)", f,
-                        file_name=out_xlsx,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    st.download_button("⬇️ تحميل Excel", f, file_name=out_xlsx,
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-                # تنزيل CSV مجمّع (يلصق الجداول مع عمود يُشير لرقم الجدول)
-                big = pd.concat(
-                    [df.assign(__جدول=i) for i, df in enumerate(tables, start=1)],
-                    ignore_index=True
-                )
-                out_csv = "pdf_tables.csv"
-                big.to_csv(out_csv, index=False, encoding="utf-8-sig")
+                out_csv = "نتائج_الاحزاب_والمرشحين.csv"
+                result_df.to_csv(out_csv, index=False, encoding="utf-8-sig")
                 with open(out_csv, "rb") as f:
-                    st.download_button("⬇️ تحميل CSV (مجمّع)", f, file_name=out_csv, mime="text/csv")
-
-            elif ocr_fallback:
-                # 2) احتياطي OCR
-                st.info("ℹ️ لم تُكتشف جداول واضحة. سنجرب OCR (Google Vision).")
-                with st.spinner("🧠 OCR قيد التشغيل..."):
-                    imgs = images_from_pdf(data, dpi=220)
-                    texts = ocr_pages_with_vision(imgs)
-
-                if not texts:
-                    st.error("❌ فشل الـ OCR أو لا يوجد نص مستخرج.")
-                else:
-                    df_lines = heuristic_lines_to_table(texts)
-                    if df_lines.empty:
-                        st.warning("⚠️ لم نتمكن من تنظيم النص إلى جدول.")
-                    else:
-                        st.success("✅ تم تنظيم النص إلى جدول مبسط (مفتاح/قيمة).")
-                        st.dataframe(df_lines, use_container_width=True, height=420)
-
-                        # تنزيلات
-                        out_xlsx = "pdf_ocr_table.xlsx"
-                        df_lines.to_excel(out_xlsx, index=False, engine="openpyxl")
-                        wb = load_workbook(out_xlsx); wb.active.sheet_view.rightToLeft = True; wb.save(out_xlsx)
-                        with open(out_xlsx, "rb") as f:
-                            st.download_button("⬇️ تحميل Excel", f,
-                                file_name=out_xlsx,
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-                        out_csv = "pdf_ocr_table.csv"
-                        df_lines.to_csv(out_csv, index=False, encoding="utf-8-sig")
-                        with open(out_csv, "rb") as f:
-                            st.download_button("⬇️ تحميل CSV", f, file_name=out_csv, mime="text/csv")
+                    st.download_button("⬇️ تحميل CSV", f, file_name=out_csv, mime="text/csv")
             else:
-                st.warning("⚠️ لم تُكتشف جداول، و(OCR) غير مفعل.")
+                st.warning("⚠️ لم يتم العثور على جداول قابلة للاستخراج أو لم تُطابق عناوين (ت/ع ص).")
+
         except Exception as e:
             st.error(f"❌ حدث خطأ أثناء التحويل: {e}")

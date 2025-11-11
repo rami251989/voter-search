@@ -1011,197 +1011,145 @@ with tab_qr:
             except Exception as e:
                 st.error(f"❌ حدث خطأ أثناء إنشاء PDF: {e}")
 # ----------------------------------------------------------------------------- #
-# 🧾 PDF → جدول (OCR فقط صارم): رقم الحزب + (ت، ع ص) لكل جدول
+# 🧾 PDF → جدول (OCR فقط): عرض النص الكامل ثم تحويله إلى (رقم الحزب + ت/ع ص)
 # ----------------------------------------------------------------------------- #
 import io, re
-import numpy as np
 import pandas as pd
 import fitz  # PyMuPDF
 
 with tab_pdf_to_table:
-    st.subheader("🧾 PDF → جدول (OCR فقط): رقم الحزب + (ت ، ع ص)")
+    st.subheader("🧾 OCR فقط: عرض النص ثم تحويله لجدول (رقم الحزب + ت/ع ص)")
 
-    pdf_file = st.file_uploader("📤 ارفع ملف PDF", type=["pdf"], key="pdf_to_table_strict")
-    c1, c2, c3 = st.columns(3)
+    pdf_file = st.file_uploader("📤 ارفع ملف PDF", type=["pdf"], key="pdf_to_table_text_first")
+    c1, c2 = st.columns(2)
     with c1:
-        dpi = st.slider("DPI (دقة التحويل للصورة)", 180, 360, 300, 10)
+        dpi = st.slider("DPI للتحويل إلى صورة", 150, 360, 300, 10)
     with c2:
-        row_tol = st.slider("حساسية تجميع الصفوف (px)", 6, 40, 14, 1)
-    with c3:
-        x_tol_ratio = st.slider("سماحية المحاذاة الأفقية", 10, 35, 18, 1) / 100.0  # نسبة من عرض الصف
+        max_preview_chars = st.slider("عدد المحارف للمعاينة (لكل صفحة)", 500, 5000, 1500, 100)
 
-    run = st.button("🚀 استخراج عبر OCR فقط", type="primary", key="run_pdf_to_table_strict")
+    run_btn = st.button("🚀 استخراج النص ثم تحويله", type="primary", key="run_text_then_table")
 
-    # ---------- أدوات ----------
-    def ar_norm(s: str) -> str:
-        if s is None: return ""
-        s = str(s)
-        s = s.replace(" ", "").replace("\u200f","").replace("\u200e","")
-        s = (s.replace("أ","ا").replace("إ","ا").replace("آ","ا")
-               .replace("ؤ","و").replace("ئ","ي").replace("ى","ي").replace("ة","ه"))
-        return s
-
+    # ---------- OCR ----------
     def render_page_png(pdf_bytes: bytes, page_i: int, dpi: int) -> bytes:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        page = doc[page_i]
         mat = fitz.Matrix(dpi/72, dpi/72)
-        pix = doc[page_i].get_pixmap(matrix=mat, alpha=False)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
         return pix.tobytes("png")
 
-    def ocr_annot(img_bytes: bytes):
+    def ocr_full_text(img_bytes: bytes) -> str:
         client = setup_google_vision()
         if client is None:
-            raise RuntimeError("Google Vision غير مهيأ.")
+            raise RuntimeError("لم يتم تهيئة Google Vision.")
         image = vision.Image(content=img_bytes)
-        return client.document_text_detection(image=image, image_context={"language_hints": ["ar"]}).full_text_annotation
+        # نعطي تلميح العربية ونستخدم Document OCR
+        resp = client.document_text_detection(image=image, image_context={"language_hints": ["ar"]})
+        txt = resp.full_text_annotation.text if resp.full_text_annotation and resp.full_text_annotation.text else ""
+        if not txt:
+            # احتياط بسيط
+            resp2 = client.text_detection(image=image)
+            txt = resp2.text_annotations[0].description if resp2.text_annotations else ""
+        return txt or ""
 
-    def extract_party_number(full_text: str) -> str | None:
-        m = re.search(r"اسم\s*الحزب\s*[:：]\s*(\d+)", full_text or "")
-        return m.group(1) if m else None
+    # ---------- تحويل النص إلى جدول ----------
+    party_re = re.compile(r"اسم\s*الحزب\s*[:：]\s*(\d+)")
+    header_re = re.compile(r".*ت.*(ع\s*ص|عص|اصوات|عدد\s*الاصوات).*")  # سطر فيه ت و(ع ص) بصيغ مختلفة
+    line_nums_re = re.compile(r"\d+")
 
-    def words_from_page(page_ann):
-        words = []
-        for b in page_ann.blocks:
-            for p in b.paragraphs:
-                for w in p.words:
-                    t = "".join(s.text for s in getattr(w, "symbols", [])) or w.text
-                    if not t: 
-                        continue
-                    xs = [v.x for v in w.bounding_box.vertices]
-                    ys = [v.y for v in w.bounding_box.vertices]
-                    words.append({
-                        "text": t,
-                        "norm": ar_norm(t),
-                        "cx": sum(xs)/4.0, "cy": sum(ys)/4.0,
-                        "x0": min(xs), "x1": max(xs),
-                        "y0": min(ys), "y1": max(ys)
-                    })
-        return words
+    def parse_party_number(full_text: str) -> str:
+        m = party_re.search(full_text)
+        return m.group(1) if m else ""
 
-    def group_rows(words, tol):
-        if not words: return []
-        words = sorted(words, key=lambda w: w["cy"])
-        rows, cur = [], [words[0]]
-        for w in words[1:]:
-            if abs(w["cy"] - cur[-1]["cy"]) <= tol:
-                cur.append(w)
-            else:
-                rows.append(sorted(cur, key=lambda x: x["cx"]))
-                cur = [w]
-        rows.append(sorted(cur, key=lambda x: x["cx"]))
-        return rows
-
-    def find_headers(rows):
+    def text_to_tables(full_text: str):
         """
-        يرجع قائمة جداول على الصفحة. كل عنصر: dict(te_x, as_x, y_header)
-        نحاول إيجاد صفوف فيها 'ت' وعمود 'ع ص/عص'.
-        قد يكون هناك جدولان (يمين/يسار) بنفس الصفحة.
+        يرجع قائمة جداول. كل جدول = list[{'ت', 'ع ص'}]
+        يبني الجداول نصياً: يبدأ بعد سطر العنوان حتى أول سطر فارغ/عنوان جديد.
         """
+        lines = [ln.strip() for ln in full_text.splitlines()]
         tables = []
-        for r in rows[:12]:  # عناوين عادةً في الأعلى
-            norm_texts = [w["norm"] for w in r]
-            # كل الكلمات التي هي بالضبط "ت"
-            te_ws  = [w for w in r if w["norm"] in ("ت","تسلسل")]
-            # أي كلمة تحتوي ع و ص (عص / ع ص / عددالاصوات...)
-            as_ws  = [w for w in r if ("ع" in w["norm"] and "ص" in w["norm"])]
-            if not te_ws or not as_ws:
+        current = None  # list rows
+
+        for ln in lines:
+            if not ln:
+                # فصل جدول عند فراغ طويل
+                if current and len(current) >= 1:
+                    tables.append(current)
+                    current = None
                 continue
-            # كوّن أزواج بحسب التقارب الأفقي
-            for tew in te_ws:
-                # الأقرب أفقيًا لـ"ت"
-                asw = min(as_ws, key=lambda w: abs(w["cx"] - tew["cx"]))
-                tables.append({"te_x": tew["cx"], "as_x": asw["cx"], "y_header": tew["cy"]})
-        # إزالة الأزواج المكررة (قريبة جدًا)
-        uniq = []
-        for t in sorted(tables, key=lambda z: (z["y_header"], z["te_x"])):
-            if not uniq or abs(t["y_header"] - uniq[-1]["y_header"]) > 10 or abs(t["te_x"] - uniq[-1]["te_x"]) > 10:
-                uniq.append(t)
-        return uniq
 
-    def nearest_numeric(row_words, target_x, x_tol_ratio):
-        if not row_words: return None
-        x_min = min(w["cx"] for w in row_words); x_max = max(w["cx"] for w in row_words)
-        x_tol = max(12.0, (x_max - x_min) * x_tol_ratio)
-        nums = [w for w in row_words if re.fullmatch(r"\d+", w["text"].strip())]
-        if not nums: return None
-        cand = min(nums, key=lambda w: abs(w["cx"] - target_x))
-        return int(cand["text"]) if abs(cand["cx"] - target_x) <= x_tol else None
+            # بداية جدول جديد عند سطر العنوان
+            if header_re.search(ln):
+                if current and len(current) >= 1:
+                    tables.append(current)
+                current = []
+                continue
 
-    def extract_tables(words, row_tol, x_tol_ratio):
-        rows = group_rows(words, tol=row_tol)
-        tables = find_headers(rows)
-        results = []   # لكل جدول: list of dict rows
-        previews = []  # نص معاينة
+            if current is not None:
+                nums = [int(n) for n in line_nums_re.findall(ln)]
+                if len(nums) >= 2:
+                    a, b = nums[0], nums[1]
+                    # heuristic: ت هو الأكبر/الأطول، ع ص هو الأصغر
+                    if (a >= 10 and b < 10) or (len(str(a)) > len(str(b))):
+                        te, votes = a, b
+                    elif (b >= 10 and a < 10) or (len(str(b)) > len(str(a))):
+                        te, votes = b, a
+                    else:
+                        te, votes = max(a, b), min(a, b)
+                    current.append({"ت": te, "ع ص": votes})
+                else:
+                    # سطر لا يحتوي زوج أرقام: اعتبره نهاية جدول
+                    if current and len(current) >= 1:
+                        tables.append(current)
+                    current = None
 
-        for ti, t in enumerate(tables, start=1):
-            te_x, as_x, y_hdr = t["te_x"], t["as_x"], t["y_header"]
-            table_rows = []
-            preview = [f"[HEADER y≈{int(y_hdr)}] ت@{int(te_x)} | ع ص@{int(as_x)}"]
-            # امشِ على الصفوف أسفل العنوان
-            for r in rows:
-                if r[0]["cy"] <= y_hdr + 6:   # تحت العنوان فقط
-                    continue
-                te_val = nearest_numeric(r, te_x, x_tol_ratio)
-                as_val = nearest_numeric(r, as_x, x_tol_ratio)
-                # معاينة قصيرة لأول 10 صفوف
-                if len(preview) < 12:
-                    preview.append(f"ت≈{te_val if te_val is not None else '—'} | ع ص≈{as_val if as_val is not None else '—'} | row: " +
-                                   " ".join(w["text"] for w in r[:8]))
-                if te_val is not None and as_val is not None:
-                    table_rows.append({"ت": te_val, "ع ص": as_val})
-            if table_rows:
-                results.append(table_rows)
-                previews.append("\n".join(preview))
-        return results, previews
+        if current and len(current) >= 1:
+            tables.append(current)
 
-    if run and pdf_file is not None:
+        return tables
+
+    if run_btn and pdf_file is not None:
         try:
             pdf_bytes = pdf_file.read()
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
             pages = doc.page_count
+
+            all_rows = []
             progress = st.progress(0, text="OCR…")
-
-            all_records = []  # صفوف نهائية
             for p in range(pages):
+                # 1) OCR → نص كامل
                 img_bytes = render_page_png(pdf_bytes, p, dpi=dpi)
-                ann = ocr_annot(img_bytes)
-                if not ann or not ann.pages:
-                    with st.expander(f"📄 صفحة {p+1}: لا يوجد نص"):
-                        st.write("—")
-                    progress.progress((p+1)/pages); 
-                    continue
+                txt = ocr_full_text(img_bytes)
 
-                full_text = ann.text or ""
-                party_no = extract_party_number(full_text) or ""
-                words = words_from_page(ann.pages[0])
+                # 2) عرض النص الخام (مختصر)
+                with st.expander(f"📄 النص الخام — صفحة {p+1}"):
+                    st.code(txt[:max_preview_chars] + ("..." if len(txt) > max_preview_chars else ""))
 
-                tables, previews = extract_tables(words, row_tol=row_tol, x_tol_ratio=x_tol_ratio)
+                # 3) رقم الحزب من النص
+                party_no = parse_party_number(txt)
 
-                # المعاينة لكل جدول
-                for gi, pv in enumerate(previews, start=1):
-                    with st.expander(f"👀 معاينة جدول {gi} — صفحة {p+1}"):
-                        if party_no:
-                            st.markdown(f"**رقم الحزب:** `{party_no}`")
-                        st.code(pv)
+                # 4) تحويل النص إلى جداول (ت/ع ص)
+                tables = text_to_tables(txt)
 
-                # دمج النتائج
-                for gi, rows_tbl in enumerate(tables, start=1):
-                    df = pd.DataFrame(rows_tbl)
-                    df.insert(0, "رقم الحزب", party_no)
-                    df["#صفحة"] = p + 1
-                    df["#جدول"] = gi
-                    all_records.append(df)
+                # 5) جمع النتائج
+                if tables:
+                    for gi, rows in enumerate(tables, start=1):
+                        df = pd.DataFrame(rows)
+                        if df.empty:
+                            continue
+                        df.insert(0, "رقم الحزب", party_no)
+                        df["#صفحة"] = p + 1
+                        df["#جدول"] = gi
+                        all_rows.append(df)
 
                 progress.progress((p+1)/pages, text=f"صفحة {p+1}/{pages} تمت")
 
-            if all_records:
-                result = pd.concat(all_records, ignore_index=True)
-                # الترتيب النهائي: رقم الحزب، #صفحة، #جدول، ت، ع ص
+            if all_rows:
+                result = pd.concat(all_rows, ignore_index=True)
                 result = result[["رقم الحزب", "#صفحة", "#جدول", "ت", "ع ص"]]
                 st.success(f"✅ تم استخراج {len(result)} صف.")
                 st.dataframe(result, use_container_width=True, height=430)
 
-                # تنزيلات
-                out_xlsx = "نتائج_الحزب_ت_عص_OCR.xlsx"
+                out_xlsx = "نتائج_الحزب_ت_عص_fromText.xlsx"
                 with pd.ExcelWriter(out_xlsx, engine="openpyxl") as w:
                     result.to_excel(w, index=False, sheet_name="نتائج")
                     ws = w.book["نتائج"]; ws.sheet_view.rightToLeft = True
@@ -1209,11 +1157,11 @@ with tab_pdf_to_table:
                     st.download_button("⬇️ تحميل Excel", f, file_name=out_xlsx,
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-                out_csv = "نتائج_الحزب_ت_عص_OCR.csv"
+                out_csv = "نتائج_الحزب_ت_عص_fromText.csv"
                 result.to_csv(out_csv, index=False, encoding="utf-8-sig")
                 with open(out_csv, "rb") as f:
                     st.download_button("⬇️ تحميل CSV", f, file_name=out_csv, mime="text/csv")
             else:
-                st.error("❌ لم تُستخرج جداول. جرّب رفع DPI أو تعديل حساسية الصفوف/المحاذاة.")
+                st.error("❌ لم نحصل على جداول من النص. راجع النص المعروض واضبط DPI/الملف.")
         except Exception as e:
             st.error(f"❌ خطأ: {e}")

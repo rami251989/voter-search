@@ -1011,7 +1011,7 @@ with tab_qr:
             except Exception as e:
                 st.error(f"❌ حدث خطأ أثناء إنشاء PDF: {e}")
 # ----------------------------------------------------------------------------- #
-# 🧾 PDF → جدول (OCR فقط) — استخراج: رقم الحزب + "ت" + "ع ص" من كل الصفحات
+# 🧾 PDF → جدول (OCR فقط) + معاينة مقاطع قريبة من "ت" و"ع ص"
 # ----------------------------------------------------------------------------- #
 import io, re, math
 import numpy as np
@@ -1019,20 +1019,22 @@ import pandas as pd
 import fitz  # PyMuPDF
 
 with tab_pdf_to_table:
-    st.subheader("🧾 تحويل PDF إلى جدول عبر Google OCR فقط")
+    st.subheader("🧾 تحويل PDF إلى جدول عبر Google OCR فقط — مع معاينة مقاطع قريبة من \"ت\" و\"ع ص\"")
 
-    pdf_file = st.file_uploader("📤 ارفع ملف PDF", type=["pdf"], key="pdf_to_table_ocr_only")
-    col1, col2 = st.columns(2)
-    with col1:
-        row_tol = st.slider("حساسية تجميع الصفوف (px)", 5, 40, 14, 1,
-                            help="قيمة أكبر = صفوف أقل (أكثر صرامة). تعتمد على دقة الصورة.")
-    with col2:
-        dpi = st.slider("دقّة تحويل الصفحة إلى صورة (DPI)", 150, 350, 260, 10,
-                        help="ارفعها إذا كان النص صغيراً.")
+    pdf_file = st.file_uploader("📤 ارفع ملف PDF", type=["pdf"], key="pdf_to_table_ocr_only_preview")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        row_tol = st.slider("حساسية تجميع الصفوف (px)", 5, 50, 16, 1,
+                            help="قيمة أكبر = صفوف أقل (أكثر صرامة).")
+    with c2:
+        dpi = st.slider("دقّة تحويل الصفحة إلى صورة (DPI)", 150, 350, 280, 10,
+                        help="ارفعها إذا كان النص صغيرًا.")
+    with c3:
+        preview_rows = st.slider("عدد الصفوف للمعاينة بعد العنوان", 5, 25, 12, 1)
 
-    run_btn = st.button("🚀 استخراج الآن (OCR)", type="primary", key="run_pdf_ocr_only")
+    run_btn = st.button("🚀 استخراج ومعاينة", type="primary", key="run_pdf_ocr_only_preview")
 
-    # ---------- أدوات مساعدة ----------
+    # ---------- أدوات ----------
     def ar_norm(s: str) -> str:
         if s is None: return ""
         s = str(s)
@@ -1053,7 +1055,7 @@ with tab_pdf_to_table:
         if client is None:
             raise RuntimeError("Vision client not configured.")
         image = vision.Image(content=img_bytes)
-        # نستخدم DOCUMENT_TEXT_DETECTION للحصول على البلوكات/الكلمات مع الإحداثيات
+        # وثّق العربية وأعطِ أقوى تحليل وثائقي
         resp = client.document_text_detection(image=image, image_context={"language_hints": ["ar"]})
         return resp.full_text_annotation
 
@@ -1063,19 +1065,17 @@ with tab_pdf_to_table:
         return m.group(1) if m else None
 
     def words_from_annotation(page):
-        """يرجع قائمة كلمات: [{'text', 'cx', 'cy', 'x0','y0','x1','y1'}] لكل صفحة."""
+        """قائمة كلمات: [{'text','norm','cx','cy','x0','y0','x1','y1'}]."""
         words = []
         for block in page.blocks:
             for para in block.paragraphs:
                 for word in para.words:
                     txt = "".join([s.text for s in word.symbols]) if hasattr(word, "symbols") else word.text
-                    if not txt: 
+                    if not txt:
                         continue
-                    # متوسط الإحداثيات
                     xs = [v.x for v in word.bounding_box.vertices]
                     ys = [v.y for v in word.bounding_box.vertices]
-                    cx = sum(xs) / 4.0
-                    cy = sum(ys) / 4.0
+                    cx = sum(xs)/4.0; cy = sum(ys)/4.0
                     words.append({
                         "text": txt,
                         "norm": ar_norm(txt),
@@ -1086,9 +1086,8 @@ with tab_pdf_to_table:
         return words
 
     def group_rows(words, tol):
-        """يجمع الكلمات إلى صفوف حسب قرب الإحداثي Y (cy)."""
+        """يجمع الكلمات إلى صفوف حسب تقارب cy."""
         if not words: return []
-        # Sort by cy
         words = sorted(words, key=lambda w: w["cy"])
         rows = []
         current = [words[0]]
@@ -1103,89 +1102,101 @@ with tab_pdf_to_table:
 
     def choose_header_indices(rows):
         """
-        يحدد صف العناوين الذي يحوي خلية 'ت' وخلية فيها 'ع' و'ص'.
-        يرجع (row_idx, te_x, as_x) حيث te_x/as_x مواقع مراكز الأعمدة.
+        يبحث عن صف العناوين الذي يحوي خلية 'ت' وخلية فيها 'ع' و'ص'.
+        يرجع (row_idx, te_x, as_x) (مركز X لكل عمود).
         """
-        for idx, row in enumerate(rows[:8]):  # نتوقع العناوين في الأعلى
+        for idx, row in enumerate(rows[:10]):  # عادة العنوان بأعلى الصفحة
             te_candidates = [w for w in row if w["norm"] == "ت"]
             as_candidates = [w for w in row if ("ع" in w["norm"] and "ص" in w["norm"])]
             if te_candidates and as_candidates:
                 te_x = te_candidates[0]["cx"]
-                # خذ الكلمة الأقرب التي تحتوي "ع" و"ص" (قد تكون "عص" أو "ع ص")
-                as_word = sorted(as_candidates, key=lambda w: w["cx"])[0]
-                as_x = as_word["cx"]
+                as_x = sorted(as_candidates, key=lambda w: w["cx"])[0]["cx"]
                 return idx, te_x, as_x
         return None, None, None
 
-    def nearest_numeric(row_words, target_x, x_tolerance_ratio=0.15):
+    def nearest_numeric(row_words, target_x, x_tolerance_ratio=0.18):
         """
-        يأخذ كلمات صف واحد ويختار الكلمة الرقمية الأقرب أفقياً إلى target_x.
-        x_tolerance_ratio يحدد سماحية الانحراف نسبة لعرض الصف.
+        يختار الكلمة الرقمية الأقرب أفقياً لـ target_x ضمن سماحية نسبية.
         """
         if not row_words: return None
-        # مجال X الكلي للصف
         x_min = min(w["cx"] for w in row_words)
         x_max = max(w["cx"] for w in row_words)
         x_tol = max(12.0, (x_max - x_min) * x_tolerance_ratio)
 
         numeric = [w for w in row_words if re.fullmatch(r"\d+", w["text"].strip())]
-        if not numeric: 
+        if not numeric:
             return None
-        # الأقرب أفقياً
         candidate = min(numeric, key=lambda w: abs(w["cx"] - float(target_x)))
         if abs(candidate["cx"] - float(target_x)) <= x_tol:
             return int(candidate["text"])
         return None
 
     def extract_table_from_page(words, row_tol):
-        """
-        يرجع DataFrame لأعمدة ('ت','ع ص') لكل صفحة.
-        يعتمد على إيجاد صف العناوين ومركزي عمودَي ت و ع ص.
-        """
+        """يرجع DataFrame ('ت','ع ص') + معلومات المعاينة."""
         rows = group_rows(words, tol=row_tol)
         hdr_idx, te_x, as_x = choose_header_indices(rows)
+        preview_lines = []  # نصوص مختصرة قريبة من العمودين
+
         if hdr_idx is None:
-            return pd.DataFrame(columns=["ت","ع ص"])
+            # لو لم نجد الرأس، أعرض أول 6 صفوف كمقاطع مرجعية
+            for r in rows[:6]:
+                preview_lines.append(" / ".join(w["text"] for w in r))
+            return pd.DataFrame(columns=["ت","ع ص"]), preview_lines, hdr_idx
+
+        # معاينة: رأس الصف + N صف بعده
+        head_txt = " / ".join(w["text"] for w in rows[hdr_idx])
+        preview_lines.append(f"[HEADER] {head_txt}")
 
         out = []
-        for r in rows[hdr_idx+1:]:
+        for r in rows[hdr_idx+1: hdr_idx+1+preview_rows]:
+            row_txt = " ".join(w["text"] for w in r)
             te_val = nearest_numeric(r, te_x)
             as_val = nearest_numeric(r, as_x)
+            # سطر معاينة مختصر يركز على ت وع ص
+            preview_lines.append(f"ت≈{te_val if te_val is not None else '—'} | ع ص≈{as_val if as_val is not None else '—'} | row: {row_txt}")
             if te_val is not None and as_val is not None:
                 out.append({"ت": te_val, "ع ص": as_val})
-        return pd.DataFrame(out)
+
+        return pd.DataFrame(out), preview_lines, hdr_idx
 
     if run_btn and pdf_file is not None:
         try:
             pdf_bytes = pdf_file.read()
-            # عدد الصفحات
             doc_tmp = fitz.open(stream=pdf_bytes, filetype="pdf")
             total_pages = doc_tmp.page_count
-            progress = st.progress(0, text="جاري المعالجة…")
+            progress = st.progress(0, text="جاري المعالجة عبر OCR…")
 
             all_rows = []
             for p in range(total_pages):
-                # 1) تحويل الصفحة لصورة
+                # 1) صورة الصفحة
                 img_bytes = render_page_png_bytes(pdf_bytes, p, dpi=dpi)
-                # 2) OCR كامل للصفحة
+                # 2) OCR كامل
                 annotation = ocr_full_annotation(img_bytes)
                 if not annotation or not annotation.pages:
-                    progress.progress((p+1)/total_pages, text=f"صفحة {p+1}/{total_pages}: لا يوجد نص")
+                    with st.expander(f"📄 صفحة {p+1}: لا يوجد نص"):
+                        st.write("—")
+                    progress.progress((p+1)/total_pages)
                     continue
 
-                # 3) رقم الحزب
                 full_text = annotation.text or ""
                 party_no = extract_party_number(full_text) or ""
 
-                # 4) تجميع الكلمات مع الإحداثيات لهذه الصفحة
-                # (full_text_annotation.pages هو هيكل Vision؛ نمر على أول صفحة فقط في هذه الصورة)
+                # 3) كلمات الصفحة
                 page_ann = annotation.pages[0]
                 words = words_from_annotation(page_ann)
 
-                # 5) استخراج جدول هذه الصفحة
-                df_page = extract_table_from_page(words, row_tol=row_tol)
+                # 4) جدول + معاينة
+                df_page, preview_lines, hdr_idx = extract_table_from_page(words, row_tol=row_tol)
 
-                # 6) دمج وإضافة معلومات الصفحة
+                with st.expander(f"👀 معاينة سريعة — صفحة {p+1}"):
+                    if party_no:
+                        st.markdown(f"**رقم الحزب:** `{party_no}`")
+                    else:
+                        st.markdown("**رقم الحزب:** لم يُلتقط")
+                    st.markdown("**مقاطع قريبة من 'ت' و'ع ص':**")
+                    for ln in preview_lines:
+                        st.code(ln)
+
                 if not df_page.empty:
                     df_page.insert(0, "رقم الحزب", party_no)
                     df_page["#صفحة"] = p + 1
@@ -1195,7 +1206,7 @@ with tab_pdf_to_table:
 
             if all_rows:
                 result_df = pd.concat(all_rows, ignore_index=True)
-                st.success(f"✅ تم استخراج {len(result_df)} صف من كل الصفحات عبر OCR فقط.")
+                st.success(f"✅ تم استخراج {len(result_df)} صف عبر OCR فقط.")
                 st.dataframe(result_df, use_container_width=True, height=430)
 
                 out_xlsx = "نتائج_الاحزاب_والمرشحين_OCROnly.xlsx"
@@ -1211,7 +1222,6 @@ with tab_pdf_to_table:
                 with open(out_csv, "rb") as f:
                     st.download_button("⬇️ تحميل CSV", f, file_name=out_csv, mime="text/csv")
             else:
-                st.error("❌ لم نتمكن من استخراج أي صف. جرّب زيادة DPI أو تقليل حساسية الصفوف.")
-
+                st.error("❌ لم نستخرج صفوف. جرّب رفع DPI أو خفض/رفع حساسية الصفوف.")
         except Exception as e:
-            st.error(f"❌ حدث خطأ أثناء OCR: {e}")
+            st.error(f"❌ خطأ OCR: {e}")

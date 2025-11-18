@@ -414,24 +414,21 @@ with tab_file:
 # ----------------------------------------------------------------------------- #
 # 4️⃣ التبويب الرابع: البحث الذكي بالاسم + مركز الاقتراع (Bagdad)
 # ----------------------------------------------------------------------------- #
-import streamlit as st
-import pandas as pd
-import time, tempfile, openpyxl, os
-from rapidfuzz import process, fuzz
-
-# from your_module import get_conn  # تأكد من وجودها
 
 # ======================= أدوات التطبيع =======================
 def normalize_ar(text: str) -> str:
     if not text:
         return ""
     s = str(text)
+    # إزالة التشكيل
     s = s.translate(str.maketrans('', '', ''.join([
         '\u0610','\u0611','\u0612','\u0613','\u0614','\u0615','\u0616','\u0617','\u0618','\u0619','\u061A',
         '\u064B','\u064C','\u064D','\u064E','\u064F','\u0650','\u0651','\u0652','\u0653','\u0654','\u0655',
         '\u0656','\u0657','\u0658','\u0659','\u065A','\u065B','\u065C','\u065D','\u065E','\u065F','\u0670'
     ])))
+    # إزالة الكشيدة والمسافات
     s = s.replace("ـ", "").replace(" ", "").strip()
+    # توحيد أشكال الحروف
     s = (s.replace("أ","ا").replace("إ","ا").replace("آ","ا")
          .replace("ؤ","و").replace("ئ","ي").replace("ى","ي").replace("ة","ه"))
     return s.lower()
@@ -444,6 +441,10 @@ def normalize_fast(s: pd.Series) -> pd.Series:
 # ======================= تحميل انتقائي من DB =======================
 @st.cache_data(show_spinner=False)
 def load_baghdad_for_centers(centers: list) -> pd.DataFrame:
+    """
+    تحميل بيانات بغداد فقط للمراكز الموجودة في الملف،
+    مع جلب (رقم الناخب + الاسم الثلاثي + اسم مركز الاقتراع + رقم مركز الاقتراع).
+    """
     conn = get_conn()
     try:
         parts = []
@@ -453,7 +454,11 @@ def load_baghdad_for_centers(centers: list) -> pd.DataFrame:
             if not batch:
                 continue
             q = """
-                SELECT "رقم الناخب","الاسم الثلاثي","اسم مركز الاقتراع"
+                SELECT
+                    "رقم الناخب",
+                    "الاسم الثلاثي",
+                    "اسم مركز الاقتراع",
+                    "رقم مركز الاقتراع"
                 FROM "Bagdad"
                 WHERE CAST("اسم مركز الاقتراع" AS TEXT) = ANY(%(centers)s)
             """
@@ -462,152 +467,180 @@ def load_baghdad_for_centers(centers: list) -> pd.DataFrame:
                 parts.append(part)
         if parts:
             return pd.concat(parts, ignore_index=True)
-        return pd.DataFrame(columns=["رقم الناخب","الاسم الثلاثي","اسم مركز الاقتراع"])
+        return pd.DataFrame(columns=[
+            "رقم الناخب","الاسم الثلاثي","اسم مركز الاقتراع","رقم مركز الاقتراع"
+        ])
     finally:
         conn.close()
 
-# ======================= واجهة Streamlit =======================
-st.title("🔎 مطابقة الناخبين - بغداد (سريع)")
+# ======================= واجهة Streamlit للتبويب الرابع =======================
+with tab_file_name_center:
+    st.subheader("🔎 البحث الذكي (اسم + مركز اقتراع) - بغداد (سريع)")
 
-# 🔑 أعطِ مفاتيح فريدة لتجنب التصادم مع شاشات/صفحات/أقسام أخرى
-file_nc = st.file_uploader(
-    "📤 ارفع ملف Excel يحتوي الاسم + اسم مركز الاقتراع",
-    type=["xlsx"],
-    key="baghdad_file_uploader_v1"
-)
-run_nc = st.button("🚀 بدء البحث ومشاهدة التقدم", key="baghdad_run_btn_v1")
+    # 🔑 مفاتيح فريدة لعناصر الواجهة
+    file_nc = st.file_uploader(
+        "📤 ارفع ملف Excel يحتوي (الاسم + اسم مركز الاقتراع)",
+        type=["xlsx"],
+        key="baghdad_file_uploader_v1"
+    )
+    run_nc = st.button("🚀 بدء البحث ومشاهدة التقدم", key="baghdad_run_btn_v1")
 
-MIN_NAME_MATCH = 60
+    MIN_NAME_MATCH = 60  # الحد الأدنى لنسبة المطابقة في الاسم
 
-if file_nc and run_nc:
-    start = time.time()
-    st.info("📦 جاري تجهيز البيانات...")
+    if file_nc and run_nc:
+        start = time.time()
+        st.info("📦 جاري تجهيز البيانات...")
 
-    # -------- قراءة الملف --------
-    try:
-        df = pd.read_excel(file_nc, engine="openpyxl")
-        df.columns = df.columns.str.strip()
-        if not {"الاسم", "اسم مركز الاقتراع"}.issubset(df.columns):
-            st.error("❌ الملف يجب أن يحتوي على الأعمدة: الاسم واسم مركز الاقتراع")
+        # -------- قراءة الملف --------
+        try:
+            df = pd.read_excel(file_nc, engine="openpyxl")
+            df.columns = df.columns.str.strip()
+            if not {"الاسم", "اسم مركز الاقتراع"}.issubset(df.columns):
+                st.error("❌ الملف يجب أن يحتوي على الأعمدة: الاسم واسم مركز الاقتراع")
+                st.stop()
+        except Exception as e:
+            st.error(f"❌ خطأ في قراءة الملف: {e}")
             st.stop()
-    except Exception as e:
-        st.error(f"❌ خطأ في قراءة الملف: {e}")
-        st.stop()
 
-    total = len(df)
-    if total == 0:
-        st.warning("⚠️ الملف فارغ.")
-        st.stop()
+        total = len(df)
+        if total == 0:
+            st.warning("⚠️ الملف فارغ.")
+            st.stop()
 
-    # -------- تطبيع الملف --------
-    df["__norm_name"] = normalize_fast(df["الاسم"])
-    df["__norm_center"] = normalize_fast(df["اسم مركز الاقتراع"])
+        # -------- تطبيع الملف --------
+        df["__norm_name"] = normalize_fast(df["الاسم"])
+        df["__norm_center"] = normalize_fast(df["اسم مركز الاقتراع"])
 
-    # -------- تحميل من القاعدة للمراكز فقط --------
-    centers = df["اسم مركز الاقتراع"].dropna().astype(str).unique().tolist()
-    db_all = load_baghdad_for_centers(centers)
-    if db_all.empty:
-        st.warning("⚠️ لا توجد بيانات مطابقة لهذه المراكز في قاعدة بغداد.")
-        st.stop()
+        # -------- تحميل من القاعدة للمراكز فقط --------
+        centers = df["اسم مركز الاقتراع"].dropna().astype(str).unique().tolist()
+        db_all = load_baghdad_for_centers(centers)
+        if db_all.empty:
+            st.warning("⚠️ لا توجد بيانات مطابقة لهذه المراكز في قاعدة بغداد.")
+            st.stop()
 
-    # -------- تطبيع القاعدة + فهارس --------
-    db_all["__norm_name"] = normalize_fast(db_all["الاسم الثلاثي"])
-    db_all["__norm_center"] = normalize_fast(db_all["اسم مركز الاقتراع"])
+        # -------- تطبيع القاعدة + فهارس --------
+        db_all["__norm_name"] = normalize_fast(db_all["الاسم الثلاثي"])
+        db_all["__norm_center"] = normalize_fast(db_all["اسم مركز الاقتراع"])
 
-    groups = {}
-    for c, sub in db_all.groupby("__norm_center", sort=False):
-        names = sub["__norm_name"].tolist()
-        data = sub[["الاسم الثلاثي", "رقم الناخب", "اسم مركز الاقتراع", "__norm_name"]].reset_index(drop=True)
-        exact = {}
-        for idx, nm in enumerate(names):
-            exact.setdefault(nm, []).append(idx)
-        groups[c] = {"names": names, "data": data, "exact": exact}
+        # بناء مجموعات لكل مركز (لتسريع البحث)
+        groups = {}
+        for c, sub in db_all.groupby("__norm_center", sort=False):
+            names = sub["__norm_name"].tolist()
+            # 👇 نحتفظ كذلك بـ "رقم مركز الاقتراع"
+            data = sub[[
+                "الاسم الثلاثي",
+                "رقم الناخب",
+                "اسم مركز الاقتراع",
+                "رقم مركز الاقتراع",
+                "__norm_name"
+            ]].reset_index(drop=True)
+            exact = {}
+            for idx, nm in enumerate(names):
+                exact.setdefault(nm, []).append(idx)
+            groups[c] = {"names": names, "data": data, "exact": exact}
 
-    # -------- واجهة التقدم --------
-    progress = st.progress(0)
-    status = st.empty()
-    log_box = st.empty()
-    st.info(f"🚀 بدء المطابقة... (عدد السجلات: {total})")
+        # -------- واجهة التقدم --------
+        progress = st.progress(0)
+        status = st.empty()
+        log_box = st.empty()
+        st.info(f"🚀 بدء المطابقة... (عدد السجلات: {total})")
 
-    cols = df.columns
-    ix_name = cols.get_loc("الاسم")
-    ix_center = cols.get_loc("اسم مركز الاقتراع")
-    ix_norm_name = cols.get_loc("__norm_name")
-    ix_norm_center = cols.get_loc("__norm_center")
+        cols = df.columns
+        ix_name = cols.get_loc("الاسم")
+        ix_center = cols.get_loc("اسم مركز الاقتراع")
+        ix_norm_name = cols.get_loc("__norm_name")
+        ix_norm_center = cols.get_loc("__norm_center")
 
-    results = []
+        results = []
 
-    # -------- حلقة المطابقة --------
-    for i, row in enumerate(df.itertuples(index=False, name=None), start=1):
-        orig_name = row[ix_name]
-        orig_center = row[ix_center]
-        norm_name = row[ix_norm_name]
-        norm_center = row[ix_norm_center]
+        # -------- حلقة المطابقة --------
+        for i, row in enumerate(df.itertuples(index=False, name=None), start=1):
+            orig_name = row[ix_name]
+            orig_center = row[ix_center]
+            norm_name = row[ix_norm_name]
+            norm_center = row[ix_norm_center]
 
-        match_row = {
-            "الاسم في الملف": str(orig_name),
-            "النسبة تطابق الاسم": 0,
-            "اسم من القاعدة": "—",
-            "تطابق المدرسة": "—",
-            "نسبة تطابق المدرسة": 0,
-            "اسم مركز الاقتراع في القاعدة": "—",
-            "رقم الناخب": "—"
-        }
+            # صف النتيجة الافتراضي
+            match_row = {
+                "الاسم في الملف": str(orig_name),
+                "اسم مركز الاقتراع في الملف": str(orig_center),
+                "النسبة تطابق الاسم": 0,
+                "اسم من القاعدة": "—",
+                "تطابق المدرسة": "—",
+                "نسبة تطابق المدرسة": 0,
+                "اسم مركز الاقتراع في القاعدة": "—",
+                "رقم مركز الاقتراع من القاعدة": "—",  # 👈 رقم المركز الصحيح من القاعدة
+                "رقم الناخب": "—"
+            }
 
-        grp = groups.get(norm_center)
-        if grp:
-            exact_hits = grp["exact"].get(norm_name)
-            if exact_hits:
-                idx = exact_hits[0]
-                rec = grp["data"].iloc[idx]
-                match_row.update({
-                    "النسبة تطابق الاسم": 100,
-                    "اسم من القاعدة": rec["الاسم الثلاثي"],
-                    "اسم مركز الاقتراع في القاعدة": rec["اسم مركز الاقتراع"],
-                    "رقم الناخب": rec["رقم الناخب"],
-                    "تطابق المدرسة": "✅",
-                    "نسبة تطابق المدرسة": 100
-                })
-            else:
-                scores = process.cdist(
-                    [norm_name], grp["names"],
-                    scorer=fuzz.token_sort_ratio,
-                    workers=-1,
-                    score_cutoff=MIN_NAME_MATCH
-                )[0]
-                if scores.size:
-                    best_idx = int(scores.argmax())
-                    best_score = float(scores[best_idx])
-                    if best_score >= MIN_NAME_MATCH:
-                        rec = grp["data"].iloc[best_idx]
-                        match_row.update({
-                            "النسبة تطابق الاسم": round(best_score, 2),
-                            "اسم من القاعدة": rec["الاسم الثلاثي"],
-                            "اسم مركز الاقتراع في القاعدة": rec["اسم مركز الاقتراع"],
-                            "رقم الناخب": rec["رقم الناخب"],
-                            "تطابق المدرسة": "✅",
-                            "نسبة تطابق المدرسة": 100
-                        })
+            grp = groups.get(norm_center)
+            if grp:
+                # 1️⃣ محاولة تطابق تام بعد التطبيع
+                exact_hits = grp["exact"].get(norm_name)
+                if exact_hits:
+                    idx = exact_hits[0]
+                    rec = grp["data"].iloc[idx]
+                    match_row.update({
+                        "النسبة تطابق الاسم": 100,
+                        "اسم من القاعدة": rec["الاسم الثلاثي"],
+                        "اسم مركز الاقتراع في القاعدة": rec["اسم مركز الاقتراع"],
+                        "رقم مركز الاقتراع من القاعدة": rec["رقم مركز الاقتراع"],
+                        "رقم الناخب": rec["رقم الناخب"],
+                        "تطابق المدرسة": "✅",
+                        "نسبة تطابق المدرسة": 100
+                    })
+                else:
+                    # 2️⃣ مطابقة غامضة (Fuzzy) على الاسم داخل نفس المركز
+                    scores = process.cdist(
+                        [norm_name],
+                        grp["names"],
+                        scorer=fuzz.token_sort_ratio,
+                        workers=-1,
+                        score_cutoff=MIN_NAME_MATCH
+                    )[0]
+                    if scores.size:
+                        best_idx = int(scores.argmax())
+                        best_score = float(scores[best_idx])
+                        if best_score >= MIN_NAME_MATCH:
+                            rec = grp["data"].iloc[best_idx]
+                            match_row.update({
+                                "النسبة تطابق الاسم": round(best_score, 2),
+                                "اسم من القاعدة": rec["الاسم الثلاثي"],
+                                "اسم مركز الاقتراع في القاعدة": rec["اسم مركز الاقتراع"],
+                                "رقم مركز الاقتراع من القاعدة": rec["رقم مركز الاقتراع"],
+                                "رقم الناخب": rec["رقم الناخب"],
+                                "تطابق المدرسة": "✅",
+                                "نسبة تطابق المدرسة": 100
+                            })
 
-        results.append(match_row)
+            results.append(match_row)
 
-        if (i % 50 == 0) or (i == total):
-            progress.progress(i / total)
-            safe_name = "" if pd.isna(orig_name) else str(orig_name)
-            log_box.text(f"🔹 {i}/{total}: {safe_name[:25]} ...")
-            status.text(f"⏱️ تمت معالجة {i}/{total} | الوقت المنقضي: {time.time() - start:.1f} ثانية")
+            # تحديث شريط التقدم كل 50 سجل أو في النهاية
+            if (i % 50 == 0) or (i == total):
+                progress.progress(i / total)
+                safe_name = "" if pd.isna(orig_name) else str(orig_name)
+                log_box.text(f"🔹 {i}/{total}: {safe_name[:25]} ...")
+                status.text(
+                    f"⏱️ تمت معالجة {i}/{total} | الوقت المنقضي: {time.time() - start:.1f} ثانية"
+                )
 
-    # -------- العرض والحفظ --------
-    final_df = pd.DataFrame(results)
-    st.dataframe(final_df, use_container_width=True, height=420, key="baghdad_table_v1")
+        # -------- العرض والحفظ --------
+        final_df = pd.DataFrame(results)
+        st.dataframe(final_df, use_container_width=True, height=420, key="baghdad_table_v1")
 
-    out_file = "نتائج_البحث_الذكي.xlsx"
-    final_df.to_excel(out_file, index=False)
+        out_file = "نتائج_البحث_الذكي.xlsx"
+        final_df.to_excel(out_file, index=False)
 
-    with open(out_file, "rb") as f:
-        st.download_button("⬇️ تحميل النتائج", f, file_name=out_file, key="baghdad_download_final_v1")
+        with open(out_file, "rb") as f:
+            st.download_button(
+                "⬇️ تحميل النتائج",
+                f,
+                file_name=out_file,
+                key="baghdad_download_final_v1"
+            )
 
-    st.success(f"✅ اكتمل البحث في {time.time() - start:.1f} ثانية", icon="✅")
+        st.success(f"✅ اكتمل البحث في {time.time() - start:.1f} ثانية", icon="✅")
+
 
 # ----------------------------------------------------------------------------- #
 # 5) 📦 عدّ البطاقات (أرقام 8 خانات) + بحث في القاعدة + قائمة الأرقام غير الموجودة
